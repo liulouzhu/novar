@@ -84,6 +84,66 @@ def _extract_conflict(parsed_result) -> tuple[bool, str | None]:
     return False, None
 
 
+def _reconcile_with_ledger(
+    batch: list[dict], ctx: RunContext,
+) -> tuple[list[dict], list[tuple[dict, str]]]:
+    """checkpoint 恢复后的工具重放对账（RecoveryState 是副作用账本）。
+
+    checkpoint 只记录"执行到哪"，不保证外部副作用 exactly-once；
+    从 checkpoint 恢复可能重入 execute_tools 节点，必须依据账本决定
+    每个 call 的处置：
+
+    - COMPLETED / FAILED / 已终态（UNKNOWN_OUTCOME / INTERRUPTED）：
+      结果已提交 session → 跳过，不重放副作用
+    - PENDING / EXECUTING + 非幂等：执行结果未知，不可自动重放
+      → 合成 UNKNOWN_OUTCOME 错误结果提交，交由模型决定下一步
+    - PENDING / EXECUTING + 幂等（read / idempotent_write）：允许重放
+
+    返回 (replay_batch, synthesized)：replay_batch 为允许执行的 call 列表，
+    synthesized 为 (call, 合成结果) 需要提交的项。
+    """
+    replay: list[dict] = []
+    synthesized: list[tuple[dict, str]] = []
+    recovery = ctx.recovery_state
+    session = ctx.session
+
+    for call in batch:
+        tc_id = call["id"]
+        record = recovery.get_record(tc_id)
+
+        if record is None:
+            # 无账本记录（理论上不会发生：batch 由 register_tool_calls_batch 注册）
+            replay.append(call)
+            continue
+
+        if record.status not in (ToolCallStatus.PENDING, ToolCallStatus.EXECUTING):
+            # 结果已提交（commit_tool_result_once 保证恰好一次）
+            logger.info("Ledger reconcile: skip completed call %s (%s)", tc_id, record.status.value)
+            continue
+
+        # 未终态 → 崩溃点在执行中。非幂等不可重放，合成结果交模型处理；
+        # 若 session.messages 里其实已有结果（终态化遗漏），commit 的幂等性兜底
+        if record.idempotency == "non_idempotent" and not (
+            session and any(
+                m.get("role") == "tool" and m.get("tool_call_id") == tc_id
+                for m in session.messages
+            )
+        ):
+            synthetic = _make_synthetic_result(
+                tc_id, record.tool_name, ToolCallStatus.UNKNOWN_OUTCOME,
+                "Recovery: outcome unknown for non-idempotent call; not replayed",
+            )
+            synthesized.append((call, synthetic))
+            recovery.mark_tool_call_terminal(
+                tc_id, ToolCallStatus.UNKNOWN_OUTCOME, "reconciled: unknown outcome",
+            )
+            continue
+
+        replay.append(call)
+
+    return replay, synthesized
+
+
 async def execute_tools(state: GraphState, ctx: RunContext) -> dict:
     """顺序执行当前批次的工具调用，返回状态增量。
 
@@ -98,6 +158,19 @@ async def execute_tools(state: GraphState, ctx: RunContext) -> dict:
     session = ctx.session
     assert session is not None, "GraphRunner 保证 session 存在"
     recovery: RecoveryState = ctx.recovery_state
+
+    # 阶段 2：仅 checkpoint 恢复的重入 turn 需要对账 —— 新 turn 的
+    # PENDING 记录是正常待执行状态，不得误判为崩溃现场
+    if ctx.resumed:
+        batch, synthesized = _reconcile_with_ledger(batch, ctx)
+        for call, synthetic in synthesized:
+            await commit_tool_result(ctx, call["id"], synthetic)
+            if ctx.on_tool:
+                ctx.on_tool("error", call["name"], call.get("arguments") or {}, synthetic, None)
+            if ctx.task_mgr.state is not None:
+                ctx.task_mgr.update_from_tool(call["name"], call.get("arguments") or {}, synthetic)
+        if synthesized:
+            await _emit_recovery(ctx)
 
     for call in batch:
         tc_id: str = call["id"]
@@ -218,14 +291,14 @@ def _make_on_retry(ctx: RunContext, name: str, arguments: dict):
     return _on_retry
 
 
-def route_after_tools(state: GraphState, ctx: RunContext) -> str:
-    """execute_tools 之后的条件路由：
+def route_after_tools(state: GraphState) -> str:
+    """execute_tools 之后的条件路由（纯 state 函数）：
     - cancelled → finalize
     - 达到最大迭代 → finalize
     - 否则回到 call_model
     """
     if state.get("run_status") == "cancelled":
         return "finalize"
-    if state.get("iteration", 0) >= ctx.options.max_iterations:
+    if state.get("iteration", 0) >= state.get("iteration_limit", 0):
         return "max_iterations"
     return "call_model"

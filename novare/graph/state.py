@@ -48,6 +48,10 @@ class GraphState(TypedDict, total=False):
     user_input: str
     system_prompt: str
 
+    # ── 路由常量（turn 开始时写入，条件边纯 state 化以支持 checkpoint 复用）──
+    iteration_limit: int               # 最大迭代次数
+    verify_enabled: bool               # 是否启用 RAG 校验子图
+
     # ── 执行进度 ──
     iteration: int                     # 已完成的模型调用轮数
     rag_used: bool                     # 是否调用过 rag_query（触发校验子图）

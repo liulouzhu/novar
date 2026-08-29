@@ -1,9 +1,8 @@
 # Novare LangGraph 重构进度（工作区 D:\Agent\novar）
 
 本工作区是 `D:\project\research-agent` 的重构副本。对应重构计划
-（原项目 `LANGGRAPH_REFACTOR_PLAN.md`）的阶段 0 + 1（MVP）已完成，
-"必须重构"的四个模块全部落地；第二批"建议重构（保留实现，改造接入方式）"
-六项已完成（见文末）。
+（原项目 `LANGGRAPH_REFACTOR_PLAN.md`）：阶段 0 + 1（MVP）、
+"必须重构"四模块、"建议重构"六项、**阶段 2（checkpoint 持久化与恢复）** 已完成。
 
 ## 已完成（阶段 0 + 1 MVP）
 
@@ -115,3 +114,45 @@
 - 新增 `tests/test_llm_json.py`（16 个）：严格/容忍解析、错误反馈重试、
   validate/convert 语义、空内容诊断、handler 注册、超时参数化
 - 全量：881 passed, 2 skipped
+
+## 第三批：阶段 2 — checkpoint 持久化与恢复
+
+### 数据职责（按计划文档执行）
+
+| 数据 | 唯一数据源 |
+| --- | --- |
+| 用户可见消息 | PostgreSQL 消息表（不变） |
+| 会话标题和列表 | Session Repository（不变） |
+| Graph 执行现场 | LangGraph checkpoint（新增） |
+| 工具副作用和幂等记录 | RecoveryState / recovery 表（保留） |
+| 任务锁和取消状态 | Redis（不变） |
+
+### 实现
+
+- **`novare/graph/checkpointer.py`（新）**：`build_checkpointer(DATABASE_URL)`
+  工厂 —— PostgreSQL → AsyncPostgresSaver（自动建表，+asyncpg URL 自动转换）；
+  无数据库 → InMemorySaver（测试/单进程回退）。`build_thread_id()`：
+  `user_id:session_id:run_id`（**turn 级**执行现场，与 RecoveryState 生命周期
+  对齐；不采用会话级累积，避免与消息表双数据源漂移）
+- **静态编译图**：`build_graph()` 改为无 ctx 构造，GraphRunner 构造时编译一次
+  挂载 checkpointer；per-turn 依赖经 `config["configurable"]["run_ctx"]` 注入
+  （不可序列化对象不进 checkpoint）；条件边改纯 state 函数
+  （`iteration_limit` / `verify_enabled` 在 turn 开始写入 state），
+  保证恢复后的路由决策与首次执行一致
+- **恢复对账**（`nodes/tools.py::_reconcile_with_ledger`）：resume 重入
+  execute_tools 时按副作用账本处置 —— COMPLETED/FAILED/已终态 → 跳过；
+  PENDING/EXECUTING + 非幂等 → 合成 UNKNOWN_OUTCOME 交模型决定；
+  PENDING/EXECUTING + 幂等 → 允许重放。仅 `resumed=True` 时生效
+- **thread_id 映射**：RecoveryState 增加 `thread_id` 字段（向后兼容），
+  随快照自动持久化到 recovery_states 表
+- **恢复路径**（agent_service）：`_restore_recovery_ledger()` fail-closed
+  恢复账本；graph 运行时显式 resume 传 `thread_id + resume + recovery_state`
+  走 checkpoint 恢复；checkpointer 构建失败自动回落 legacy
+- **checkpoint 清理**：正常完成（completed）的 turn 自动 `adelete_thread`；
+  cancelled/timeout/error/max_iterations 保留供显式恢复
+
+### 阶段 2 测试
+
+- 新增 `tests/test_graph_checkpoint.py`（7 个）：thread_id 映射、中途崩溃
+  resume 后工具零重放（副作用恰好一次）、completed 清理、对账三路处置
+- 全量：888 passed, 2 skipped

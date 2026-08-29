@@ -27,6 +27,7 @@ from novare.hallucination_verifier import HallucinationVerifier  # noqa: E402
 from novare.llm_client import LLMClient  # noqa: E402
 from novare.mcp_client import McpClient  # noqa: E402
 from novare.recovery.classifier import sanitize_error  # noqa: E402
+from novare.recovery.state import RecoveryState  # noqa: E402
 from novare.reflexion import ReflexionState  # noqa: E402
 from novare.session import Session  # noqa: E402
 from novare.tools.registry import ToolDef, ToolRegistry  # noqa: E402
@@ -195,7 +196,7 @@ class AgentService:
         else:
             self.hallucination_verifier = None
 
-        self.agent = self._build_agent_runtime()
+        self.agent = await self._build_agent_runtime()
 
         self.subagent_registry = SubagentRegistry()
         register_subagent_tools(
@@ -215,12 +216,15 @@ class AgentService:
             type(self.agent).__name__,
         )
 
-    def _build_agent_runtime(self):
+    async def _build_agent_runtime(self):
         """按 NOVARE_AGENT_RUNTIME 构造 legacy AgentLoop 或 LangGraph GraphRunner。
 
         两者 run_turn 签名兼容，run_turn 调用点无需区分。
         Reflexion 尚未迁移到 graph 运行时（计划阶段 3 子图化），
         显式开启时回落 legacy 并告警，避免静默行为差异。
+
+        阶段 2：GraphRunner 挂载 LangGraph checkpointer（DATABASE_URL 指向
+        PostgreSQL 时用 AsyncPostgresSaver，否则进程内回退）。
         """
         use_graph = (
             self.config.agent_runtime == "langgraph"
@@ -231,7 +235,63 @@ class AgentService:
                 "NOVARE_AGENT_RUNTIME=langgraph 暂不支持 Reflexion，已回落 legacy 运行时"
             )
 
-        shared_kwargs = dict(
+        shared_kwargs = self._legacy_shared_kwargs()
+
+        if not use_graph:
+            return AgentLoop(
+                llm_client=self.llm_client,
+                reflexion_enabled=self.config.reflexion_enabled,
+                max_reflections_per_turn=self.config.max_reflections_per_turn,
+                reflexion_no_progress_threshold=self.config.reflexion_no_progress_threshold,
+                reflexion_repeated_failure_threshold=self.config.reflexion_repeated_failure_threshold,
+                reflexion_timeout=self.config.reflexion_timeout,
+                reflexion_max_tokens=self.config.reflexion_max_tokens,
+                reflexion_max_recent_events=self.config.reflexion_max_recent_events,
+                **shared_kwargs,
+            )
+
+        from novare.graph.checkpointer import build_checkpointer
+        try:
+            checkpointer = await build_checkpointer(os.environ.get("DATABASE_URL"))
+        except Exception as exc:
+            # checkpoint 不可用时回落 legacy：编排可用性优先于新运行时
+            logger.error("Failed to build LangGraph checkpointer, falling back to legacy: %s",
+                         sanitize_error(str(exc))[:300])
+            return self._build_legacy_agent_loop()
+
+        model_port = build_model_port(
+            port_name=self.config.model_port,
+            llm_client=self.llm_client,
+            chat_model=(
+                build_langchain_chat_model(
+                    model=self.config.model,
+                    api_key=self.config.api_key,
+                    base_url=self.config.base_url,
+                )
+                if self.config.model_port == "langchain"
+                else None
+            ),
+        )
+        logger.info("Using LangGraph agent runtime (model_port=%s)", self.config.model_port)
+        return GraphRunner(model=model_port, checkpointer=checkpointer, **shared_kwargs)
+
+    def _build_legacy_agent_loop(self) -> AgentLoop:
+        """legacy AgentLoop 构造（fallback 与显式 legacy 共用）。"""
+        return AgentLoop(
+            llm_client=self.llm_client,
+            reflexion_enabled=self.config.reflexion_enabled,
+            max_reflections_per_turn=self.config.max_reflections_per_turn,
+            reflexion_no_progress_threshold=self.config.reflexion_no_progress_threshold,
+            reflexion_repeated_failure_threshold=self.config.reflexion_repeated_failure_threshold,
+            reflexion_timeout=self.config.reflexion_timeout,
+            reflexion_max_tokens=self.config.reflexion_max_tokens,
+            reflexion_max_recent_events=self.config.reflexion_max_recent_events,
+            **self._legacy_shared_kwargs(),
+        )
+
+    def _legacy_shared_kwargs(self) -> dict:
+        """两个运行时共享的构造参数（源自 NovareConfig）。"""
+        return dict(
             tool_registry=self.tool_registry,
             system_prompt=self.config.system_prompt,
             reviewer_llm=self.reviewer_llm,
@@ -251,35 +311,6 @@ class AgentService:
             max_retries_per_turn=self.config.max_retries_per_turn,
             retry_after_max_delay=self.config.retry_after_max_delay,
         )
-
-        if not use_graph:
-            return AgentLoop(
-                llm_client=self.llm_client,
-                reflexion_enabled=self.config.reflexion_enabled,
-                max_reflections_per_turn=self.config.max_reflections_per_turn,
-                reflexion_no_progress_threshold=self.config.reflexion_no_progress_threshold,
-                reflexion_repeated_failure_threshold=self.config.reflexion_repeated_failure_threshold,
-                reflexion_timeout=self.config.reflexion_timeout,
-                reflexion_max_tokens=self.config.reflexion_max_tokens,
-                reflexion_max_recent_events=self.config.reflexion_max_recent_events,
-                **shared_kwargs,
-            )
-
-        model_port = build_model_port(
-            port_name=self.config.model_port,
-            llm_client=self.llm_client,
-            chat_model=(
-                build_langchain_chat_model(
-                    model=self.config.model,
-                    api_key=self.config.api_key,
-                    base_url=self.config.base_url,
-                )
-                if self.config.model_port == "langchain"
-                else None
-            ),
-        )
-        logger.info("Using LangGraph agent runtime (model_port=%s)", self.config.model_port)
-        return GraphRunner(model=model_port, **shared_kwargs)
 
     async def shutdown(self):
         """关闭时清理资源"""
@@ -324,6 +355,44 @@ class AgentService:
         if user_id:
             return Path(get_user_workspace(user_id))
         return self.config.workspace
+
+    async def _restore_recovery_ledger(
+        self, session_id: str, run_id: str, user_id: str,
+    ) -> RecoveryState:
+        """从指定 run 的 recovery_data 恢复工具副作用账本（graph checkpoint resume 用）。
+
+        recovery_data 即 RecoveryState.to_dict() 全量快照（含 tool_calls、
+        committed ids 与 thread_id）。校验与 fail-closed 语义与
+        _restore_reflexion_state 一致。
+        """
+        try:
+            user_uuid = UUID(user_id)
+            async with get_session_factory()() as db:
+                repo = RecoveryStateRepository(db, user_uuid)
+                model = await repo.get_by_run_id(session_id, run_id)
+                if model is None:
+                    logger.warning("Recovery resume: run not found (fail closed)")
+                    raise RecoveryResumeError()
+                data = model.recovery_data or {}
+                if not data.get("run_id"):
+                    raise RecoveryResumeError()
+                state = RecoveryState.from_dict(data)
+                if not state.thread_id:
+                    # 旧快照无 checkpoint 映射 → 无法走 checkpoint resume
+                    raise RecoveryResumeError()
+                logger.info(
+                    "Recovery resume: session=%s run=%s thread=%s tool_calls=%d",
+                    session_id, run_id, state.thread_id, len(state.tool_calls),
+                )
+                return state
+        except RecoveryResumeError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Recovery resume failed, rejecting (fail closed): %s",
+                sanitize_error(str(exc))[:300],
+            )
+            raise RecoveryResumeError() from None
 
     async def _restore_reflexion_state(
         self, session_id: str, run_id: str, user_id: str,
@@ -697,6 +766,20 @@ class AgentService:
                     })
                     return
 
+            # ── 阶段 2：graph 运行时的 checkpoint 恢复参数 ──
+            # 显式 resume 时恢复副作用账本（含 thread_id 映射），
+            # 从同一 thread 的最后一个 checkpoint 继续执行。
+            graph_run_kwargs: dict = {}
+            if isinstance(self.agent, GraphRunner) and recovery_run_id and user_id:
+                restored_ledger = await self._restore_recovery_ledger(
+                    session.session_id, recovery_run_id, user_id,
+                )
+                graph_run_kwargs = dict(
+                    thread_id=restored_ledger.thread_id,
+                    resume=True,
+                    recovery_state=restored_ledger,
+                )
+
             # PR 3：Reflexion 事件持久化（event_key 幂等）
             async def on_reflexion_event(event_type: str, payload: dict):
                 queue.put_nowait({"type": "reflexion_event", "event_type": event_type, **payload})
@@ -737,6 +820,7 @@ class AgentService:
                 on_reflexion_event=on_reflexion_event,
                 on_reflexion_state=on_reflexion_state,
                 initial_reflexion_state=restored_reflexion_state,
+                **graph_run_kwargs,
             )
 
             # ── PR 2：根据 RecoveryState.run_status 标记状态 ──

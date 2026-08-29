@@ -313,6 +313,9 @@ class RecoveryState:
     assistant_message_committed: bool = False
     # batch 中所有 tool_call_id（用于完整性检查）
     batch_tool_call_ids: list[str] = field(default_factory=list)
+    # LangGraph checkpoint thread_id（阶段 2：checkpoint 与 recovery run 的映射；
+    # 旧快照缺省为空字符串，恢复时回退 legacy 语义）
+    thread_id: str = ""
 
     def register_tool_calls_batch(
         self,
@@ -475,6 +478,7 @@ class RecoveryState:
             "committed_tool_result_ids": list(self.committed_tool_result_ids),
             "assistant_message_committed": self.assistant_message_committed,
             "batch_tool_call_ids": list(self.batch_tool_call_ids),
+            "thread_id": self.thread_id,
         }
 
     @classmethod
@@ -496,6 +500,7 @@ class RecoveryState:
             committed_tool_result_ids=set(data.get("committed_tool_result_ids", [])),
             assistant_message_committed=data.get("assistant_message_committed", False),
             batch_tool_call_ids=data.get("batch_tool_call_ids", []),
+            thread_id=data.get("thread_id", ""),
         )
         for tc_id, tc_data in data.get("tool_calls", {}).items():
             state.tool_calls[tc_id] = ToolCallRecord.from_dict(tc_data)

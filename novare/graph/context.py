@@ -92,6 +92,7 @@ class RunContext:
 
     # ── 运行期内部状态 ──
     streamed_final: bool = False                       # 最终回答是否已流式输出
+    resumed: bool = False                              # 从 checkpoint 恢复的重入 turn
 
     def remaining_seconds(self) -> float:
         return max(0.0, self.deadline - time.monotonic())

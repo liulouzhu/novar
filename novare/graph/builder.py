@@ -9,18 +9,22 @@
     max_iterations → finalize
     finalize → END
 
-依赖注入方式：每个 run_turn 用闭包捕获 RunContext 构图（构图成本为
-内存操作，微秒级）。MVP 不接入 checkpointer，因此不需要复用编译产物；
-阶段 2 引入 checkpoint 时再切换为"静态图 + configurable"。
+阶段 2 改造：图为静态编译产物（GraphRunner 构造时 build 一次并挂载
+checkpointer），per-turn 依赖（RunContext）经 config["configurable"]["run_ctx"]
+注入节点；条件边只读 state（iteration_limit / verify_enabled 在 turn 开始时
+写入 state），保证 checkpoint 恢复后的路由决策与首次执行一致。
+
+checkpointer 只序列化 GraphState（全 dict/int/str/bool），RunContext 中的
+session、model port、回调等不可序列化对象不进入 checkpoint。
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
-from novare.graph.context import RunContext
 from novare.graph.nodes.finalize import (
     bootstrap,
     finalize,
@@ -34,40 +38,47 @@ from novare.graph.state import GraphState
 logger = logging.getLogger("novare.graph.builder")
 
 
-async def _max_iterations_node(state: GraphState, ctx: RunContext) -> dict:
+def _ctx(config) -> Any:
+    """从 RunnableConfig 提取 turn-scoped RunContext（不可序列化依赖）。"""
+    return config["configurable"]["run_ctx"]
+
+
+async def bootstrap_node(state: GraphState, config) -> dict:
+    return await bootstrap(state, _ctx(config))
+
+
+async def call_model_node(state: GraphState, config) -> dict:
+    return await call_model(state, _ctx(config))
+
+
+async def execute_tools_node(state: GraphState, config) -> dict:
+    return await execute_tools(state, _ctx(config))
+
+
+async def verify_node(state: GraphState, config) -> dict:
+    return await verify_answer(state, _ctx(config))
+
+
+async def max_iterations_node(state: GraphState) -> dict:
     """达到最大迭代：标记状态，具体提示在 finalize 输出。"""
     return {"run_status": "max_iterations"}
 
 
-def build_graph(ctx: RunContext):
-    """按 RunContext 构建并编译主图。"""
+async def finalize_node(state: GraphState, config) -> dict:
+    return await finalize(state, _ctx(config))
 
-    # LangGraph 通过 iscoroutinefunction 判断节点类型，必须注册
-    # async 闭包函数（lambda 返回 coroutine 会被当作同步返回值）
-    async def bootstrap_node(state: GraphState) -> dict:
-        return await bootstrap(state, ctx)
 
-    async def call_model_node(state: GraphState) -> dict:
-        return await call_model(state, ctx)
-
-    async def execute_tools_node(state: GraphState) -> dict:
-        return await execute_tools(state, ctx)
-
-    async def verify_node(state: GraphState) -> dict:
-        return await verify_answer(state, ctx)
-
-    async def max_iter_node(state: GraphState) -> dict:
-        return {"run_status": "max_iterations"}
-
-    async def finalize_node(state: GraphState) -> dict:
-        return await finalize(state, ctx)
-
+def build_graph(checkpointer=None):
+    """构建并编译主图。checkpointer 由 GraphRunner 注入（见 checkpointer.py）。"""
     g = StateGraph(GraphState)
+
+    # LangGraph 通过 iscoroutinefunction 判断节点类型；第二参数 config
+    # 由框架按签名自动传入
     g.add_node("bootstrap", bootstrap_node)
     g.add_node("call_model", call_model_node)
     g.add_node("execute_tools", execute_tools_node)
     g.add_node("verify_answer", verify_node)
-    g.add_node("max_iterations", max_iter_node)
+    g.add_node("max_iterations", max_iterations_node)
     g.add_node("finalize", finalize_node)
 
     g.add_edge(START, "bootstrap")
@@ -75,7 +86,7 @@ def build_graph(ctx: RunContext):
 
     g.add_conditional_edges(
         "call_model",
-        lambda state: route_after_model(state, ctx),
+        route_after_model,
         {
             "execute_tools": "execute_tools",
             "verify_answer": "verify_answer",
@@ -84,7 +95,7 @@ def build_graph(ctx: RunContext):
     )
     g.add_conditional_edges(
         "execute_tools",
-        lambda state: route_after_tools(state, ctx),
+        route_after_tools,
         {
             "call_model": "call_model",
             "max_iterations": "max_iterations",
@@ -95,4 +106,4 @@ def build_graph(ctx: RunContext):
     g.add_edge("max_iterations", "finalize")
     g.add_edge("finalize", END)
 
-    return g.compile()
+    return g.compile(checkpointer=checkpointer) if checkpointer else g.compile()

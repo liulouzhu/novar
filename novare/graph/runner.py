@@ -3,15 +3,24 @@
 对外保持与 AgentLoop.run_turn 完全一致的调用签名，Web / CLI / Channels
 无需感知运行时差异即可切换（NOVARE_AGENT_RUNTIME=langgraph）。
 
+阶段 2（checkpoint 持久化）：
+- 静态编译图：GraphRunner 构造时 build 一次并挂载 checkpointer；
+  per-turn 依赖经 config["configurable"]["run_ctx"] 注入（不可序列化对象
+  不进 checkpoint）
+- thread_id = user_id:session_id:run_id（turn 级执行现场，见 checkpointer.py）
+- resume=True 时从 checkpoint 继续执行（graph.ainvoke(None)），
+  配合注入的 RecoveryState 账本完成工具重放对账
+- 正常完成的 turn 自动清理 checkpoint；cancelled / timeout / error /
+  max_iterations 保留 checkpoint 供显式恢复
+
 与 legacy 的行为对齐点：
 - timeout / cancel / exception 三路终态化（terminalize_on_*）
 - 回调集合与触发时机（on_text / on_tool / on_message / on_task_state /
   on_recovery_state / on_verification / on_compact）
 - 取消返回 "任务已取消。"；超时返回友好提示
-- tool_context 作为 user_id / workspace 的只读透传通道保留
 
 MVP 范围外（graph 模式暂不支持，构造时显式拒绝）：
-- Reflexion（计划阶段 3 迁移为子图）
+- Reflexion（阶段 3 迁移为子图）
 """
 
 from __future__ import annotations
@@ -26,12 +35,14 @@ from novare.context_compactor import HybridContextCompactor
 from novare.graph.adapters.model import ModelPort
 from novare.graph.builder import build_graph
 from novare.graph.context import RunContext, RuntimeOptions
+from novare.graph.state import GraphState
 from novare.recovery.policy import RetryBudget
 from novare.recovery.terminalize import (
     terminalize_on_cancel,
     terminalize_on_exception,
     terminalize_on_timeout,
 )
+from novare.recovery.state import RecoveryState, RunStatus
 from novare.session import Session
 
 logger = logging.getLogger("novare.graph.runner")
@@ -82,10 +93,12 @@ class GraphRunner:
         retry_sleep: Callable[[float], Awaitable[None]] | None = None,
         retry_random: Callable[[float, float], float] | None = None,
         reviewer_llm=None,
+        checkpointer=None,
     ):
         self.model = model
         self.tool_registry = tool_registry
         self.system_prompt = system_prompt
+        self.checkpointer = checkpointer
         self.options = RuntimeOptions(
             max_iterations=max_iterations,
             turn_timeout=turn_timeout,
@@ -110,6 +123,8 @@ class GraphRunner:
         # 兼容 legacy 注入点（测试 / 上层可能替换 sleep、random）
         self._retry_sleep = retry_sleep or asyncio.sleep
         self._retry_random = retry_random or _random.uniform
+        # 静态编译图：checkpointer 挂载在编译期，RunContext 走 config 注入
+        self._graph = build_graph(checkpointer)
 
     async def run_turn(
         self,
@@ -126,12 +141,21 @@ class GraphRunner:
         on_message: Callable[[dict], Awaitable[None] | None] | None = None,
         on_verification: Callable[[dict], Awaitable[None] | None] | None = None,
         on_recovery_state: Callable[[dict], Awaitable[None] | None] | None = None,
+        *,
+        thread_id: str | None = None,
+        resume: bool = False,
+        recovery_state: RecoveryState | None = None,
         **_ignored,
     ) -> str:
         """执行一轮对话。签名与 AgentLoop.run_turn 一致。
 
-        **_ignored 吸收 legacy 专有参数（on_reflexion_event 等），
-        保证 agent_service 可以无差别地调用两种运行时。
+        阶段 2 新增（keyword-only，legacy 运行时通过 **_ignored 吸收对应参数）：
+        - thread_id: checkpoint 线程标识；缺省从 tool_context 的 user_id +
+          session_id + recovery run_id 推导
+        - resume: True 时从 thread_id 的最后一个 checkpoint 继续执行
+          （user_input 仍用于恢复 RunContext / TaskState 的目标描述）
+        - recovery_state: 恢复的副作用账本（RecoveryState.from_dict 产物）；
+          resume 时应传入，新 turn 传 None 自动新建
         """
         if on_verification is not None and (
             self.hallucination_verifier is None
@@ -154,23 +178,36 @@ class GraphRunner:
             on_message=on_message,
             on_verification=on_verification,
             on_recovery_state=on_recovery_state,
+            recovery_state=recovery_state,
+            resumed=resume,
         )
-        graph = build_graph(ctx)
 
-        initial_state = {
-            "user_input": user_input,
-            "system_prompt": system_prompt if system_prompt is not None else self.system_prompt,
-            "messages": [],
-            "iteration": 0,
-            "rag_used": False,
-            "tool_calls_present": False,
-            "pending_tool_calls": [],
-            "run_status": "running",
+        if thread_id is None:
+            user_id = ctx.tool_context.get("user_id") or "anonymous"
+            session_id = getattr(session, "session_id", "") or "no-session"
+            thread_id = f"{user_id}:{session_id}:{ctx.recovery_state.run_id}"
+        # run_id 与 thread_id 建立映射（随快照持久化到 recovery_states 表）
+        if not ctx.recovery_state.thread_id:
+            ctx.recovery_state.thread_id = thread_id
+
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "run_ctx": ctx,
+            },
+            "recursion_limit": self._recursion_limit(),
         }
+
+        if resume:
+            # checkpoint 恢复：None 输入表示从最后一个 checkpoint 继续，
+            # state（messages / iteration / pending_tool_calls）由框架还原
+            invoke_input = None
+        else:
+            invoke_input = self._initial_state(user_input, system_prompt)
 
         try:
             final_state = await asyncio.wait_for(
-                graph.ainvoke(initial_state, config={"recursion_limit": self._recursion_limit()}),
+                self._graph.ainvoke(invoke_input, config=config),
                 timeout=self.options.turn_timeout,
             )
         except asyncio.TimeoutError:
@@ -180,6 +217,7 @@ class GraphRunner:
             )
             await terminalize_on_timeout(ctx.recovery_state, session)
             await self._emit_recovery_state(on_recovery_state, ctx.recovery_state)
+            # 保留 checkpoint 供显式恢复
             return (
                 f"本轮任务超时（超过 {self.options.turn_timeout} 秒），"
                 "请简化问题或拆分为更小的子任务后重试。"
@@ -198,7 +236,44 @@ class GraphRunner:
             await self._emit_recovery_state(on_recovery_state, ctx.recovery_state)
             raise
 
+        # 正常完成的 turn 清理 checkpoint（无恢复价值）；
+        # cancelled 保留 —— 前端可显式恢复
+        if final_state.get("run_status") == "completed":
+            await self._discard_checkpoint(thread_id)
+
         return final_state.get("final_answer") or ""
+
+    def _initial_state(self, user_input: str, system_prompt: str | None) -> GraphState:
+        effective_prompt = system_prompt if system_prompt is not None else self.system_prompt
+        return {
+            "user_input": user_input,
+            "system_prompt": effective_prompt,
+            "messages": [],
+            "iteration": 0,
+            "rag_used": False,
+            "tool_calls_present": False,
+            "pending_tool_calls": [],
+            "run_status": "running",
+            # 条件边路由常量：写入 state 使路由决策随 checkpoint 可恢复
+            "iteration_limit": self.options.max_iterations,
+            "verify_enabled": bool(
+                self.hallucination_verifier and self.hallucination_verifier.enabled
+            ),
+        }
+
+    async def _discard_checkpoint(self, thread_id: str) -> None:
+        """正常完成后删除 thread 的 checkpoint，防止表无限增长。"""
+        delete = getattr(self._graph.checkpointer, "adelete_thread", None) if self._graph.checkpointer else None
+        if delete is None:
+            return
+        try:
+            await delete(thread_id)
+        except Exception:
+            logger.debug("checkpoint discard failed for %s", thread_id, exc_info=True)
+
+    def get_thread_state(self, thread_id: str):
+        """读取 thread 的当前 checkpoint 状态（诊断 / 恢复预检用）。"""
+        return self._graph.get_state({"configurable": {"thread_id": thread_id}})
 
     def _recursion_limit(self) -> int:
         # 每次迭代消耗 2 个 super-step（call_model + execute_tools），
@@ -215,8 +290,9 @@ class GraphRunner:
         tool_context: dict | None,
         on_text, on_tool, on_task_state, on_compact,
         should_cancel, on_message, on_verification, on_recovery_state,
+        recovery_state: RecoveryState | None,
+        resumed: bool = False,
     ) -> RunContext:
-        effective_prompt = system_prompt if system_prompt is not None else self.system_prompt
         compactor = self.context_compactor
         if compactor is None:
             compactor = HybridContextCompactor(
@@ -235,6 +311,7 @@ class GraphRunner:
             session=session,
             tool_context=tool_context,
             autosave=autosave,
+            recovery_state=recovery_state or RecoveryState(),
             budget=RetryBudget(max_retries=self.options.max_retries_per_turn),
             deadline=time.monotonic() + self.options.turn_timeout,
             on_text=on_text,
@@ -245,6 +322,7 @@ class GraphRunner:
             on_message=on_message,
             on_verification=on_verification,
             on_recovery_state=on_recovery_state,
+            resumed=resumed,
         )
 
     @staticmethod

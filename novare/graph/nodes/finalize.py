@@ -56,7 +56,11 @@ async def bootstrap(state: GraphState, ctx: RunContext) -> dict:
         updates["run_status"] = "cancelled"
         return updates
 
-    session.add_user_message(user_input)
+    # resume 幂等防护：从无 checkpoint 的早期恢复时 bootstrap 可能重放，
+    # 不重复写入用户消息
+    last = session.messages[-1] if session.messages else None
+    if not (last and last.get("role") == "user" and last.get("content") == user_input):
+        session.add_user_message(user_input)
     await _emit_message(ctx, session.messages[-1])
     updates["messages"] = [session.messages[-1]]
     return updates
@@ -149,12 +153,12 @@ async def finalize(state: GraphState, ctx: RunContext) -> dict:
     return updates
 
 
-def route_after_model(state: GraphState, ctx: RunContext) -> str:
-    """call_model 之后的条件路由。"""
+def route_after_model(state: GraphState) -> str:
+    """call_model 之后的条件路由（纯 state 函数：路由常量在 turn 开始时写入）。"""
     if state.get("run_status") == "cancelled":
         return "finalize"
     if state.get("tool_calls_present"):
         return "execute_tools"
-    if state.get("rag_used") and ctx.verifier is not None and ctx.verifier.enabled:
+    if state.get("rag_used") and state.get("verify_enabled"):
         return "verify_answer"
     return "finalize"
