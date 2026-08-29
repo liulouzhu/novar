@@ -18,6 +18,7 @@ from novare.context_manager import (
     generate_summary,
     merge_compaction_summaries,
 )
+from novare.llm_json import call_llm_json  # noqa: F401  JSON 解析/重试统一入口
 
 logger = logging.getLogger("novare.context.compactor")
 
@@ -215,18 +216,6 @@ def _tool_name_map(messages: list[dict]) -> dict[str, str]:
             if tool_id:
                 names[tool_id] = name
     return names
-
-
-def _parse_json_object(text: str) -> dict:
-    stripped = text.strip()
-    fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, re.DOTALL | re.IGNORECASE)
-    if fence:
-        stripped = fence.group(1).strip()
-    decoder = json.JSONDecoder()
-    value, end = decoder.raw_decode(stripped)
-    if stripped[end:].strip() or not isinstance(value, dict):
-        raise ValueError("Compaction response must contain exactly one JSON object")
-    return value
 
 
 def _extract_references(text: str) -> set[str]:
@@ -536,45 +525,36 @@ class HybridContextCompactor:
             *(str(candidate.get("evidence", "")) for candidate in tool_candidates.values()),
             *protected_facts,
         ])
-        last_error = ""
-        for attempt in range(1, self.max_llm_attempts + 1):
-            messages = [
-                {"role": "system", "content": _COMPACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ]
-            if last_error:
-                messages.append({
-                    "role": "user",
-                    "content": "Previous output was rejected: " + last_error + ". Return corrected JSON only.",
-                })
-            try:
-                response = await asyncio.wait_for(
-                    self.llm_client.chat(
-                        messages,
-                        tools=None,
-                        max_tokens=self.summary_max_tokens,
-                    ),
-                    timeout=self.llm_timeout,
-                )
-                payload = _parse_json_object(response.content)
-                _validate_no_invented_references(payload, reference_source)
-                history, tools = _validate_llm_summary(
-                    payload,
-                    required_tool_ids=set(tool_candidates),
-                    history_required=bool(existing_summary or removed_messages),
-                )
-                return history, tools, attempt
-            except Exception as exc:
-                last_error = str(exc)[:500]
-                if attempt >= self.max_llm_attempts:
-                    logger.warning(
-                        "LLM context compaction exhausted %d attempt(s): %s",
-                        attempt,
-                        last_error,
-                    )
-                    return None, None, attempt
-                logger.info("Retrying LLM context compaction after validation failure: %s", last_error)
-        return None, None, self.max_llm_attempts
+
+        def _validate_and_convert(payload: dict) -> dict:
+            # 校验链：防伪造引用 → 结构校验（返回转换后的摘要数据）
+            _validate_no_invented_references(payload, reference_source)
+            history, tools = _validate_llm_summary(
+                payload,
+                required_tool_ids=set(tool_candidates),
+                history_required=bool(existing_summary or removed_messages),
+            )
+            return {"history": history, "tools": tools}
+
+        try:
+            result, attempt = await call_llm_json(
+                self.llm_client,
+                system_prompt=_COMPACTION_SYSTEM_PROMPT,
+                user_prompt=prompt,
+                max_tokens=self.summary_max_tokens,
+                convert=_validate_and_convert,
+                timeout=self.llm_timeout,
+                max_attempts=self.max_llm_attempts,
+            )
+            return result["history"], result["tools"], attempt
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "LLM context compaction exhausted %d attempt(s): %s",
+                self.max_llm_attempts, str(exc)[:500],
+            )
+            return None, None, self.max_llm_attempts
 
     def _build_prompt(
         self,

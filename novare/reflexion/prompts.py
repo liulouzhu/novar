@@ -74,7 +74,8 @@ def build_reflection_user_prompt(
             "attempts": ev.get("attempts"),
             "outcome": ev.get("outcome"),
             # 只放脱敏后的短摘要，不放原始结果
-            "summary": sanitize_error(str(ev.get("summary") or ""))[:200],        }
+            "summary": sanitize_error(str(ev.get("summary") or ""))[:200],
+        }
         for ev in event_summaries
     ]
 

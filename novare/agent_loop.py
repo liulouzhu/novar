@@ -36,6 +36,7 @@ from novare.recovery.state import (
     ToolCallStatus,
     _make_synthetic_result,
     commit_tool_result_once,  # re-export：函数本体已移至 recovery.state（协议层归属）
+    query_tool_retry_semantics,
 )
 from novare.recovery.terminalize import (
     terminalize_on_cancel,
@@ -701,26 +702,11 @@ class AgentLoop:
         )
 
     def _tool_retry_policy(self, name: str) -> RetryPolicy:
-        """查询工具的重试策略并强制执行幂等保护。"""
-        declared: RetryPolicy | None = None
-        retry_getter = getattr(self.tool_registry, "retry_policy_for", None)
-        if callable(retry_getter):
-            try:
-                candidate = retry_getter(name)
-                if isinstance(candidate, RetryPolicy):
-                    declared = candidate
-            except Exception:
-                declared = None
+        """查询工具的重试策略并强制执行幂等保护。
 
-        idempotency = "non_idempotent"
-        idem_getter = getattr(self.tool_registry, "idempotency_for", None)
-        if callable(idem_getter):
-            try:
-                candidate = idem_getter(name)
-                if candidate in ("read", "idempotent_write", "non_idempotent"):
-                    idempotency = candidate
-            except Exception:
-                idempotency = "non_idempotent"
+        探测逻辑统一在 recovery.state.query_tool_retry_semantics。
+        """
+        declared, idempotency = query_tool_retry_semantics(self.tool_registry, name)
 
         if idempotency == "non_idempotent":
             max_attempts = 1

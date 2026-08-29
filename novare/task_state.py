@@ -115,21 +115,11 @@ class TaskStateManager:
         if tool_name not in state.tools_used:
             state.tools_used.append(tool_name)
 
-        # 按工具类型提取信息
-        if tool_name == "paper_search":
-            _handle_paper_search(state, arguments, result)
-        elif tool_name == "paper_parse":
-            _handle_paper_parse(state, arguments, result)
-        elif tool_name == "rag_query":
-            _handle_rag_query(state, arguments, result)
-        elif tool_name == "knowledge_graph":
-            _handle_knowledge_graph(state, arguments, result)
-        elif tool_name == "code_execute":
-            _handle_code_execute(state, arguments, result)
-        elif tool_name == "reviewer_evaluate":
-            _handle_reviewer_evaluate(state, arguments, result)
-        elif tool_name == "innovation_search":
-            _handle_innovation_search(state, arguments, result)
+        # 按注册的 handler 提取信息；未注册的工具（如 MCP 动态工具）静默跳过，
+        # 可通过 register_tool_handler() 为新工具注册提取器
+        handler = _TOOL_HANDLERS.get(tool_name)
+        if handler is not None:
+            handler(state, arguments, result)
 
     def record_completion(self, step: str) -> None:
         """记录已完成步骤（自动去重）"""
@@ -202,6 +192,15 @@ def _infer_pending_steps(user_input: str) -> list[str]:
 
 
 # ── 工具结果提取 ────────────────────────────────────────────
+
+def register_tool_handler(tool_name: str, handler) -> None:
+    """为新工具注册结果提取器（handler(state, arguments, result)）。
+
+    内置提取器只覆盖已知领域工具；MCP 注册的动态工具对任务状态更新
+    默认静默，调用方可通过此 API 为其注册提取器，无需修改本模块。
+    """
+    _TOOL_HANDLERS[tool_name] = handler
+
 
 def _handle_paper_search(state: TaskState, arguments: dict, result: str) -> None:
     """处理 paper_search 结果 — JSON 优先，regex 降级"""
@@ -387,3 +386,17 @@ def _handle_paper_search_legacy(state: TaskState, arguments: dict, result: str) 
         title = match.strip()[:120]
         if title:
             _add_finding(state, title)
+
+
+# ── 工具 → 提取器映射表 ──────────────────────────────────────
+# 在全部 _handle_* 定义之后构建；新工具经 register_tool_handler() 注册
+
+_TOOL_HANDLERS: dict = {
+    "paper_search": _handle_paper_search,
+    "paper_parse": _handle_paper_parse,
+    "rag_query": _handle_rag_query,
+    "knowledge_graph": _handle_knowledge_graph,
+    "code_execute": _handle_code_execute,
+    "reviewer_evaluate": _handle_reviewer_evaluate,
+    "innovation_search": _handle_innovation_search,
+}

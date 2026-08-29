@@ -3,19 +3,15 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
 
 from mcp import ClientSession, StdioServerParameters, stdio_client
 
+# McpServerConfig 唯一定义在 novare.config（config.json 反序列化所属）；
+# 此处 re-export 保持既有 import 路径可用。原本地定义（env 默认 None、
+# 与 config 版本字段不一致）已删除，统一后的定义含可选 cwd 字段。
+from novare.config import McpServerConfig  # noqa: F401
+
 logger = logging.getLogger("novare.mcp")
-
-
-@dataclass
-class McpServerConfig:
-    command: str
-    args: list[str] = field(default_factory=list)
-    env: dict[str, str] | None = None
-    cwd: str | None = None
 
 
 class McpClient:

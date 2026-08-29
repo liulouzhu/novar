@@ -47,6 +47,9 @@ async def handle_spawn_subagent(args: dict, **kwargs) -> str:
     workspace = kwargs.get("workspace")
     default_max_iterations: int = kwargs.get("default_max_iterations", 16)
     turn_timeout: int = kwargs.get("turn_timeout", 600)
+    # 同步等待上限默认与子 agent 自身 turn_timeout 对齐（原硬编码 300s
+    # 小于 turn_timeout=600，会在子 agent 仍在执行时提前放弃）
+    await_timeout: float = kwargs.get("subagent_await_timeout", float(turn_timeout))
 
     # 解析参数
     type_str = args.get("subagent_type", "general")
@@ -95,14 +98,14 @@ async def handle_spawn_subagent(args: dict, **kwargs) -> str:
 
     if await_result:
         # 同步模式：等待子智能体完成
-        logger.info("Spawn subagent %s (await_result=true)", record.subagent_id)
+        logger.info("Spawn subagent %s (await_result=true, timeout=%.0fs)", record.subagent_id, await_timeout)
         await registry.start(record.subagent_id, coro)
         try:
-            result = await asyncio.wait_for(record.asyncio_task, timeout=300)
+            result = await asyncio.wait_for(record.asyncio_task, timeout=await_timeout)
             output = registry.get_output(record.subagent_id)
             return json.dumps(output.to_dict() if output else {"error": "结果获取失败"}, ensure_ascii=False)
         except asyncio.TimeoutError:
-            registry.fail(record.subagent_id, "执行超时（300s）")
+            registry.fail(record.subagent_id, f"执行超时（{await_timeout:.0f}s）")
             return json.dumps({"error": "子智能体执行超时", "subagent_id": record.subagent_id}, ensure_ascii=False)
     else:
         # 异步模式：启动后立即返回

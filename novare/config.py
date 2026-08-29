@@ -13,6 +13,53 @@ class McpServerConfig:
     command: str
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    cwd: str | None = None
+
+
+# ── 环境变量读取辅助（收敛 load() 中的重复样板）──────────────
+# 语义约定与原实现一致：字符串/数值以"非空"为覆盖条件，
+# 布尔以"已设置"为条件（显式 0/false 可关闭默认开启的项）。
+
+def _env_str(name: str, current: str) -> str:
+    raw = os.environ.get(name)
+    return raw if raw else current
+
+
+def _env_path(name: str, current: Path) -> Path:
+    raw = os.environ.get(name)
+    return Path(raw).resolve() if raw else current
+
+
+def _env_bool(name: str, current: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return current
+    return raw.lower() in ("1", "true", "yes")
+
+
+def _env_number(name: str, current, cast, lo=None, hi=None):
+    """读取数值型环境变量并 clamp；非法值告警后保留原值。"""
+    raw = os.environ.get(name)
+    if not raw:
+        return current
+    try:
+        value = cast(raw)
+    except ValueError:
+        print(f"[novare.config] WARNING: invalid {name}={raw!r}, keeping default {current}")
+        return current
+    if lo is not None:
+        value = max(lo, value)
+    if hi is not None:
+        value = min(hi, value)
+    return value
+
+
+def _env_int(name: str, current: int, lo=None, hi=None) -> int:
+    return _env_number(name, current, int, lo, hi)
+
+
+def _env_float(name: str, current: float, lo=None, hi=None) -> float:
+    return _env_number(name, current, float, lo, hi)
 
 
 def _any_channel_enabled(channels: dict) -> bool:
@@ -129,245 +176,100 @@ class NovareConfig:
         # 加载 .env 文件（当前工作目录）
         load_dotenv(Path.cwd() / ".env")
 
-        # 环境变量覆盖
-        cfg.api_key = os.environ.get("NOVARE_API_KEY", cfg.api_key)
-        cfg.base_url = os.environ.get("NOVARE_BASE_URL", cfg.base_url)
-        cfg.model = os.environ.get("NOVARE_MODEL", cfg.model)
+        # ── 模型与评审模型 ──
+        cfg.api_key = _env_str("NOVARE_API_KEY", cfg.api_key)
+        cfg.base_url = _env_str("NOVARE_BASE_URL", cfg.base_url)
+        cfg.model = _env_str("NOVARE_MODEL", cfg.model)
+        cfg.reviewer_api_key = _env_str("NOVARE_REVIEWER_API_KEY", cfg.reviewer_api_key)
+        cfg.reviewer_base_url = _env_str("NOVARE_REVIEWER_BASE_URL", cfg.reviewer_base_url)
+        cfg.reviewer_model = _env_str("NOVARE_REVIEWER_MODEL", cfg.reviewer_model)
+        cfg.proxy = _env_str("NOVARE_PROXY", cfg.proxy)
 
-        # 评审模型（可选）
-        cfg.reviewer_api_key = os.environ.get("NOVARE_REVIEWER_API_KEY", cfg.reviewer_api_key)
-        cfg.reviewer_base_url = os.environ.get("NOVARE_REVIEWER_BASE_URL", cfg.reviewer_base_url)
-        cfg.reviewer_model = os.environ.get("NOVARE_REVIEWER_MODEL", cfg.reviewer_model)
+        # ── 目录 ──
+        cfg.data_dir = _env_path("NOVARE_DATA_DIR", cfg.data_dir)
+        cfg.workspace = _env_path("NOVARE_WORKSPACE", cfg.workspace)
 
-        data_dir = os.environ.get("NOVARE_DATA_DIR")
-        if data_dir:
-            cfg.data_dir = Path(data_dir).resolve()
+        # ── 迭代与超时 ──
+        cfg.max_iterations = _env_int("NOVARE_MAX_ITERATIONS", cfg.max_iterations)
+        cfg.subagent_max_iterations = _env_int("NOVARE_SUBAGENT_MAX_ITERATIONS", cfg.subagent_max_iterations)
+        cfg.turn_timeout = _env_int("NOVARE_TURN_TIMEOUT", cfg.turn_timeout)
+        cfg.subagent_turn_timeout = _env_int("NOVARE_SUBAGENT_TURN_TIMEOUT", cfg.subagent_turn_timeout)
 
-        workspace = os.environ.get("NOVARE_WORKSPACE")
-        if workspace:
-            cfg.workspace = Path(workspace).resolve()
-
-        # 迭代次数
-        max_iter = os.environ.get("NOVARE_MAX_ITERATIONS")
-        if max_iter:
-            cfg.max_iterations = int(max_iter)
-        sub_max_iter = os.environ.get("NOVARE_SUBAGENT_MAX_ITERATIONS")
-        if sub_max_iter:
-            cfg.subagent_max_iterations = int(sub_max_iter)
-
-        turn_timeout = os.environ.get("NOVARE_TURN_TIMEOUT")
-        if turn_timeout:
-            cfg.turn_timeout = int(turn_timeout)
-        sub_turn_timeout = os.environ.get("NOVARE_SUBAGENT_TURN_TIMEOUT")
-        if sub_turn_timeout:
-            cfg.subagent_turn_timeout = int(sub_turn_timeout)
-
-        # Agent 运行时（LangGraph 重构）
-        agent_runtime = os.environ.get("NOVARE_AGENT_RUNTIME")
-        if agent_runtime and agent_runtime in ("legacy", "langgraph"):
-            cfg.agent_runtime = agent_runtime
+        # ── Agent 运行时（LangGraph 重构）──
+        runtime = os.environ.get("NOVARE_AGENT_RUNTIME")
+        if runtime and runtime in ("legacy", "langgraph"):
+            cfg.agent_runtime = runtime
         model_port = os.environ.get("NOVARE_MODEL_PORT")
         if model_port and model_port in ("legacy", "langchain"):
             cfg.model_port = model_port
 
-        # 重试配置（PR 1）
-        llm_retry = os.environ.get("NOVARE_LLM_RETRY_ATTEMPTS")
-        if llm_retry:
-            cfg.llm_retry_attempts = int(llm_retry)
-        retry_base = os.environ.get("NOVARE_RETRY_BASE_DELAY")
-        if retry_base:
-            cfg.retry_base_delay = float(retry_base)
-        retry_max = os.environ.get("NOVARE_RETRY_MAX_DELAY")
-        if retry_max:
-            cfg.retry_max_delay = float(retry_max)
-        max_retries_turn = os.environ.get("NOVARE_MAX_RETRIES_PER_TURN")
-        if max_retries_turn:
-            cfg.max_retries_per_turn = int(max_retries_turn)
-        retry_after_max = os.environ.get("NOVARE_RETRY_AFTER_MAX_DELAY")
-        if retry_after_max:
-            cfg.retry_after_max_delay = float(retry_after_max)
+        # ── 重试（PR 1）──
+        cfg.llm_retry_attempts = _env_int("NOVARE_LLM_RETRY_ATTEMPTS", cfg.llm_retry_attempts, lo=1, hi=10)
+        cfg.retry_base_delay = _env_float("NOVARE_RETRY_BASE_DELAY", cfg.retry_base_delay, lo=0.0, hi=60.0)
+        cfg.retry_max_delay = _env_float("NOVARE_RETRY_MAX_DELAY", cfg.retry_max_delay, hi=600.0)
+        cfg.max_retries_per_turn = _env_int("NOVARE_MAX_RETRIES_PER_TURN", cfg.max_retries_per_turn, lo=0, hi=100)
+        cfg.retry_after_max_delay = _env_float("NOVARE_RETRY_AFTER_MAX_DELAY", cfg.retry_after_max_delay, lo=1.0, hi=600.0)
+        cfg.retry_max_delay = max(cfg.retry_base_delay, cfg.retry_max_delay)
 
-        # Reflexion 配置（PR 3）
-        reflexion_enabled = os.environ.get("NOVARE_REFLEXION_ENABLED")
-        if reflexion_enabled is not None:
-            cfg.reflexion_enabled = reflexion_enabled.lower() in ("1", "true", "yes")
-        max_reflections = os.environ.get("NOVARE_MAX_REFLECTIONS_PER_TURN")
-        if max_reflections:
-            cfg.max_reflections_per_turn = int(max_reflections)
-        refl_np = os.environ.get("NOVARE_REFLECTION_NO_PROGRESS_THRESHOLD")
-        if refl_np:
-            cfg.reflexion_no_progress_threshold = int(refl_np)
-        refl_rf = os.environ.get("NOVARE_REFLECTION_REPEATED_FAILURE_THRESHOLD")
-        if refl_rf:
-            cfg.reflexion_repeated_failure_threshold = int(refl_rf)
-        refl_timeout = os.environ.get("NOVARE_REFLECTION_TIMEOUT")
-        if refl_timeout:
-            cfg.reflexion_timeout = float(refl_timeout)
-        refl_tokens = os.environ.get("NOVARE_REFLECTION_MAX_TOKENS")
-        if refl_tokens:
-            cfg.reflexion_max_tokens = int(refl_tokens)
-        refl_events = os.environ.get("NOVARE_REFLECTION_MAX_RECENT_EVENTS")
-        if refl_events:
-            cfg.reflexion_max_recent_events = int(refl_events)
+        # ── Reflexion（PR 3）──
+        cfg.reflexion_enabled = _env_bool("NOVARE_REFLEXION_ENABLED", cfg.reflexion_enabled)
+        cfg.max_reflections_per_turn = _env_int("NOVARE_MAX_REFLECTIONS_PER_TURN", cfg.max_reflections_per_turn, lo=1, hi=10)
+        cfg.reflexion_no_progress_threshold = _env_int("NOVARE_REFLECTION_NO_PROGRESS_THRESHOLD", cfg.reflexion_no_progress_threshold, lo=1, hi=20)
+        cfg.reflexion_repeated_failure_threshold = _env_int("NOVARE_REFLECTION_REPEATED_FAILURE_THRESHOLD", cfg.reflexion_repeated_failure_threshold, lo=1, hi=20)
+        cfg.reflexion_timeout = _env_float("NOVARE_REFLECTION_TIMEOUT", cfg.reflexion_timeout, lo=1.0, hi=300.0)
+        cfg.reflexion_max_tokens = _env_int("NOVARE_REFLECTION_MAX_TOKENS", cfg.reflexion_max_tokens, lo=100, hi=8000)
+        cfg.reflexion_max_recent_events = _env_int("NOVARE_REFLECTION_MAX_RECENT_EVENTS", cfg.reflexion_max_recent_events, lo=1, hi=50)
 
-        # 代理
-        proxy = os.environ.get("NOVARE_PROXY")
-        if proxy:
-            cfg.proxy = proxy
+        # ── Redis ──
+        cfg.redis_enabled = _env_bool("NOVARE_REDIS_ENABLED", cfg.redis_enabled)
+        cfg.redis_url = _env_str("NOVARE_REDIS_URL", cfg.redis_url)
 
-        # Redis（可选）
-        redis_enabled = os.environ.get("NOVARE_REDIS_ENABLED")
-        if redis_enabled is not None:
-            cfg.redis_enabled = redis_enabled.lower() in ("1", "true", "yes")
-        redis_url = os.environ.get("NOVARE_REDIS_URL")
-        if redis_url:
-            cfg.redis_url = redis_url
-
-        # 多渠道（环境变量覆盖）
-        channels_enabled = os.environ.get("NOVARE_CHANNELS_ENABLED")
-        if channels_enabled:
-            cfg.channels_enabled = channels_enabled.lower() in ("1", "true", "yes")
-        channel_default_user = os.environ.get("NOVARE_CHANNEL_DEFAULT_USER_ID")
-        if channel_default_user:
-            cfg.channel_default_user_id = channel_default_user
+        # ── 多渠道 ──
+        cfg.channels_enabled = _env_bool("NOVARE_CHANNELS_ENABLED", cfg.channels_enabled)
+        cfg.channel_default_user_id = _env_str("NOVARE_CHANNEL_DEFAULT_USER_ID", cfg.channel_default_user_id)
         weixin_token = os.environ.get("NOVARE_WEIXIN_TOKEN")
         if weixin_token:
             cfg.channels.setdefault("weixin", {})["token"] = weixin_token
             cfg.channels["weixin"]["enabled"] = True
             cfg.channels_enabled = True
 
-        # 长期记忆
-        enable_memory = os.environ.get("NOVARE_ENABLE_LONG_TERM_MEMORY")
-        if enable_memory is not None:
-            cfg.enable_long_term_memory = enable_memory.lower() in ("1", "true", "yes")
-        max_mem = os.environ.get("NOVARE_MAX_MEMORIES_PER_USER")
-        if max_mem:
-            cfg.max_memories_per_user = int(max_mem)
+        # ── 长期记忆 ──
+        cfg.enable_long_term_memory = _env_bool("NOVARE_ENABLE_LONG_TERM_MEMORY", cfg.enable_long_term_memory)
+        cfg.max_memories_per_user = _env_int("NOVARE_MAX_MEMORIES_PER_USER", cfg.max_memories_per_user)
 
-        # 上下文管理
-        compact_threshold = os.environ.get("NOVARE_AUTO_COMPACT_THRESHOLD")
-        if compact_threshold:
-            cfg.auto_compact_threshold = int(compact_threshold)
-        context_max_turns = os.environ.get("NOVARE_CONTEXT_MAX_TURNS")
-        if context_max_turns:
-            cfg.context_max_turns = int(context_max_turns)
-        context_token_budget = os.environ.get("NOVARE_CONTEXT_TOKEN_BUDGET")
-        if context_token_budget:
-            cfg.context_token_budget = int(context_token_budget)
-        context_summary_max = os.environ.get("NOVARE_CONTEXT_SUMMARY_MAX_TOKENS")
-        if context_summary_max:
-            cfg.context_summary_max_tokens = int(context_summary_max)
-        context_tool_max = os.environ.get("NOVARE_CONTEXT_TOOL_RESULT_MAX_TOKENS")
-        if context_tool_max:
-            cfg.context_tool_result_max_tokens = int(context_tool_max)
-        context_llm_timeout = os.environ.get("NOVARE_CONTEXT_LLM_TIMEOUT")
-        if context_llm_timeout:
-            cfg.context_llm_timeout = int(context_llm_timeout)
-        context_llm_enabled = os.environ.get("NOVARE_CONTEXT_LLM_ENABLED")
-        if context_llm_enabled is not None:
-            cfg.context_llm_enabled = context_llm_enabled.lower() in ("1", "true", "yes")
+        # ── 上下文管理 ──
+        cfg.auto_compact_threshold = _env_int("NOVARE_AUTO_COMPACT_THRESHOLD", cfg.auto_compact_threshold)
+        cfg.context_max_turns = _env_int("NOVARE_CONTEXT_MAX_TURNS", cfg.context_max_turns, lo=1, hi=20)
+        cfg.context_token_budget = _env_int("NOVARE_CONTEXT_TOKEN_BUDGET", cfg.context_token_budget, lo=1_000, hi=200_000)
+        cfg.context_summary_max_tokens = _env_int("NOVARE_CONTEXT_SUMMARY_MAX_TOKENS", cfg.context_summary_max_tokens, lo=300, hi=8_000)
+        cfg.context_tool_result_max_tokens = _env_int("NOVARE_CONTEXT_TOOL_RESULT_MAX_TOKENS", cfg.context_tool_result_max_tokens, lo=200, hi=5_000)
+        cfg.context_llm_timeout = _env_int("NOVARE_CONTEXT_LLM_TIMEOUT", cfg.context_llm_timeout, lo=1, hi=120)
+        cfg.context_llm_enabled = _env_bool("NOVARE_CONTEXT_LLM_ENABLED", cfg.context_llm_enabled)
 
-        verifier_enabled = os.environ.get("NOVARE_HALLUCINATION_VERIFIER_ENABLED")
-        if verifier_enabled is not None:
-            cfg.hallucination_verifier_enabled = verifier_enabled.lower() in ("1", "true", "yes")
-        verifier_max_claims = os.environ.get("NOVARE_HALLUCINATION_VERIFIER_MAX_CLAIMS")
-        if verifier_max_claims:
-            cfg.hallucination_verifier_max_claims = int(verifier_max_claims)
-        verifier_top_k = os.environ.get("NOVARE_HALLUCINATION_VERIFIER_TOP_K")
-        if verifier_top_k:
-            cfg.hallucination_verifier_top_k = int(verifier_top_k)
-        verifier_concurrency = os.environ.get("NOVARE_HALLUCINATION_VERIFIER_CONCURRENCY")
-        if verifier_concurrency:
-            cfg.hallucination_verifier_concurrency = int(verifier_concurrency)
-        verifier_timeout = os.environ.get("NOVARE_HALLUCINATION_VERIFIER_TIMEOUT")
-        if verifier_timeout:
-            cfg.hallucination_verifier_timeout = int(verifier_timeout)
+        # ── 幻觉检测 ──
+        cfg.hallucination_verifier_enabled = _env_bool("NOVARE_HALLUCINATION_VERIFIER_ENABLED", cfg.hallucination_verifier_enabled)
+        cfg.hallucination_verifier_max_claims = _env_int("NOVARE_HALLUCINATION_VERIFIER_MAX_CLAIMS", cfg.hallucination_verifier_max_claims, lo=1, hi=15)
+        cfg.hallucination_verifier_top_k = _env_int("NOVARE_HALLUCINATION_VERIFIER_TOP_K", cfg.hallucination_verifier_top_k, lo=1, hi=10)
+        cfg.hallucination_verifier_concurrency = _env_int("NOVARE_HALLUCINATION_VERIFIER_CONCURRENCY", cfg.hallucination_verifier_concurrency, lo=1, hi=8)
+        cfg.hallucination_verifier_timeout = _env_int("NOVARE_HALLUCINATION_VERIFIER_TIMEOUT", cfg.hallucination_verifier_timeout, lo=10, hi=600)
 
-        # 情景记忆
-        ep_enabled = os.environ.get("NOVARE_EPISODIC_MEMORY_ENABLED")
-        if ep_enabled is not None:
-            cfg.episodic_memory_enabled = ep_enabled.lower() in ("1", "true", "yes")
-        ep_top_k = os.environ.get("NOVARE_EPISODIC_MEMORY_TOP_K")
-        if ep_top_k:
-            cfg.episodic_memory_top_k = int(ep_top_k)
-        ep_min_imp = os.environ.get("NOVARE_EPISODIC_MEMORY_MIN_IMPORTANCE")
-        if ep_min_imp:
-            cfg.episodic_memory_min_importance = float(ep_min_imp)
-        ep_min_conf = os.environ.get("NOVARE_EPISODIC_MEMORY_MIN_CONFIDENCE")
-        if ep_min_conf:
-            cfg.episodic_memory_min_confidence = float(ep_min_conf)
-        ep_max_turn = os.environ.get("NOVARE_EPISODIC_MEMORY_MAX_PER_TURN")
-        if ep_max_turn:
-            cfg.episodic_memory_max_per_turn = int(ep_max_turn)
-        ep_collection = os.environ.get("NOVARE_EPISODIC_MEMORY_COLLECTION")
-        if ep_collection:
-            cfg.episodic_memory_collection = ep_collection
-        ep_min_sim = os.environ.get("NOVARE_EPISODIC_MEMORY_MIN_SIMILARITY")
-        if ep_min_sim:
-            cfg.episodic_memory_min_similarity = float(ep_min_sim)
+        # ── 情景记忆 ──
+        cfg.episodic_memory_enabled = _env_bool("NOVARE_EPISODIC_MEMORY_ENABLED", cfg.episodic_memory_enabled)
+        cfg.episodic_memory_top_k = _env_int("NOVARE_EPISODIC_MEMORY_TOP_K", cfg.episodic_memory_top_k, lo=1, hi=20)
+        cfg.episodic_memory_min_importance = _env_float("NOVARE_EPISODIC_MEMORY_MIN_IMPORTANCE", cfg.episodic_memory_min_importance, lo=0.0, hi=1.0)
+        cfg.episodic_memory_min_confidence = _env_float("NOVARE_EPISODIC_MEMORY_MIN_CONFIDENCE", cfg.episodic_memory_min_confidence, lo=0.0, hi=1.0)
+        cfg.episodic_memory_min_similarity = _env_float("NOVARE_EPISODIC_MEMORY_MIN_SIMILARITY", cfg.episodic_memory_min_similarity, lo=-1.0, hi=1.0)
+        cfg.episodic_memory_max_per_turn = _env_int("NOVARE_EPISODIC_MEMORY_MAX_PER_TURN", cfg.episodic_memory_max_per_turn, lo=1, hi=10)
+        cfg.episodic_memory_collection = _env_str("NOVARE_EPISODIC_MEMORY_COLLECTION", cfg.episodic_memory_collection)
 
-        # 批量记忆提取调度
-        mem_interval = os.environ.get("NOVARE_MEMORY_EXTRACTION_INTERVAL_TURNS")
-        if mem_interval:
-            cfg.memory_extraction_interval_turns = int(mem_interval)
-        mem_idle = os.environ.get("NOVARE_MEMORY_EXTRACTION_IDLE_SECONDS")
-        if mem_idle:
-            cfg.memory_extraction_idle_seconds = int(mem_idle)
-        mem_flush = os.environ.get("NOVARE_MEMORY_EXTRACTION_FLUSH_ON_SWITCH")
-        if mem_flush is not None:
-            cfg.memory_extraction_flush_on_switch = mem_flush.lower() in ("1", "true", "yes")
+        # ── 批量记忆提取调度 ──
+        cfg.memory_extraction_interval_turns = _env_int("NOVARE_MEMORY_EXTRACTION_INTERVAL_TURNS", cfg.memory_extraction_interval_turns, lo=1, hi=50)
+        cfg.memory_extraction_idle_seconds = _env_int("NOVARE_MEMORY_EXTRACTION_IDLE_SECONDS", cfg.memory_extraction_idle_seconds, lo=10, hi=3600)
+        cfg.memory_extraction_flush_on_switch = _env_bool("NOVARE_MEMORY_EXTRACTION_FLUSH_ON_SWITCH", cfg.memory_extraction_flush_on_switch)
 
-        # 测试 embedding fallback
-        test_fallback = os.environ.get("NOVARE_TEST_EMBEDDING_FALLBACK")
-        if test_fallback is not None:
-            cfg.test_embedding_fallback = test_fallback.lower() in ("1", "true", "yes")
+        # ── 测试 embedding fallback ──
+        cfg.test_embedding_fallback = _env_bool("NOVARE_TEST_EMBEDDING_FALLBACK", cfg.test_embedding_fallback)
 
-        # 情景记忆配置校验
-        cfg.episodic_memory_top_k = max(1, min(20, cfg.episodic_memory_top_k))
-        cfg.episodic_memory_min_importance = max(0.0, min(1.0, cfg.episodic_memory_min_importance))
-        cfg.episodic_memory_min_confidence = max(0.0, min(1.0, cfg.episodic_memory_min_confidence))
-        cfg.episodic_memory_min_similarity = max(-1.0, min(1.0, cfg.episodic_memory_min_similarity))
-        cfg.episodic_memory_max_per_turn = max(1, min(10, cfg.episodic_memory_max_per_turn))
-
-        # 上下文压缩配置校验
-        cfg.context_max_turns = max(1, min(20, cfg.context_max_turns))
-        cfg.context_token_budget = max(1_000, min(200_000, cfg.context_token_budget))
-        cfg.context_summary_max_tokens = max(300, min(8_000, cfg.context_summary_max_tokens))
-        cfg.context_tool_result_max_tokens = max(200, min(5_000, cfg.context_tool_result_max_tokens))
-        cfg.context_llm_timeout = max(1, min(120, cfg.context_llm_timeout))
-
-        # 重试配置校验（PR 1）
-        cfg.llm_retry_attempts = max(1, min(10, cfg.llm_retry_attempts))
-        cfg.retry_base_delay = max(0.0, min(60.0, cfg.retry_base_delay))
-        cfg.retry_max_delay = max(cfg.retry_base_delay, min(600.0, cfg.retry_max_delay))
-        cfg.max_retries_per_turn = max(0, min(100, cfg.max_retries_per_turn))
-        cfg.retry_after_max_delay = max(1.0, min(600.0, cfg.retry_after_max_delay))
-
-        # Reflexion 配置校验（PR 3）
-        cfg.max_reflections_per_turn = max(1, min(10, cfg.max_reflections_per_turn))
-        cfg.reflexion_no_progress_threshold = max(1, min(20, cfg.reflexion_no_progress_threshold))
-        cfg.reflexion_repeated_failure_threshold = max(1, min(20, cfg.reflexion_repeated_failure_threshold))
-        cfg.reflexion_timeout = max(1.0, min(300.0, cfg.reflexion_timeout))
-        cfg.reflexion_max_tokens = max(100, min(8000, cfg.reflexion_max_tokens))
-        cfg.reflexion_max_recent_events = max(1, min(50, cfg.reflexion_max_recent_events))
-
-        # 幻觉检测配置校验
-        cfg.hallucination_verifier_max_claims = max(
-            1, min(15, cfg.hallucination_verifier_max_claims)
-        )
-        cfg.hallucination_verifier_top_k = max(
-            1, min(10, cfg.hallucination_verifier_top_k)
-        )
-        cfg.hallucination_verifier_concurrency = max(
-            1, min(8, cfg.hallucination_verifier_concurrency)
-        )
-        cfg.hallucination_verifier_timeout = max(
-            10, min(600, cfg.hallucination_verifier_timeout)
-        )
-
-        # 批量记忆提取配置校验
-        cfg.memory_extraction_interval_turns = max(1, min(50, cfg.memory_extraction_interval_turns))
-        cfg.memory_extraction_idle_seconds = max(10, min(3600, cfg.memory_extraction_idle_seconds))
         # Collection 名只允许安全字符
         import re
         if not re.match(r'^[a-zA-Z0-9_]+$', cfg.episodic_memory_collection):

@@ -275,7 +275,10 @@ def evaluate_triggers(
 
 
 def compute_action_fingerprint(tool_name: str, arguments: dict) -> str:
-    """计算动作指纹（与 RecoveryState 语义一致，脱敏后 canonical JSON + SHA-256）。"""
-    from novare.recovery.state import _compute_action_fingerprint
+    """计算动作指纹（与 RecoveryState 语义一致，脱敏后 canonical JSON + SHA-256）。
 
-    return _compute_action_fingerprint(tool_name, arguments)
+    引用 recovery.state 的公开 API，不触碰私有函数。
+    """
+    from novare.recovery.state import compute_action_fingerprint as _fingerprint
+
+    return _fingerprint(tool_name, arguments)

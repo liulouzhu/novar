@@ -25,7 +25,12 @@ from novare.graph.state import GraphState
 from novare.recovery.classifier import classify_tool_result, sanitize_error
 from novare.recovery.executor import retry_tool_call
 from novare.recovery.policy import RetryPolicy
-from novare.recovery.state import RecoveryState, ToolCallStatus, _make_synthetic_result
+from novare.recovery.state import (
+    RecoveryState,
+    ToolCallStatus,
+    _make_synthetic_result,
+    query_tool_retry_semantics,
+)
 from novare.recovery.terminalize import terminalize_on_cancel
 from novare.recovery.types import Outcome
 from novare.task_state import TaskState
@@ -48,12 +53,10 @@ async def _emit_recovery(ctx: RunContext) -> None:
 def _tool_retry_policy(ctx: RunContext, name: str) -> RetryPolicy:
     """查询工具重试策略并强制幂等保护（非幂等工具 max_attempts=1）。
 
-    与 legacy AgentLoop._tool_retry_policy 语义一致，但直接走显式协议方法，
-    不再 getattr 探测。
+    探测逻辑统一在 recovery.state.query_tool_retry_semantics。
     """
     opts = ctx.options
-    declared = ctx.tools.retry_policy_for(name)
-    idempotency = ctx.tools.idempotency_for(name)
+    declared, idempotency = query_tool_retry_semantics(ctx.tools, name)
     max_attempts = 1 if idempotency == "non_idempotent" else (
         declared.max_attempts if declared else 1
     )

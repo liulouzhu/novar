@@ -1,8 +1,9 @@
 # Novare LangGraph 重构进度（工作区 D:\Agent\novar）
 
 本工作区是 `D:\project\research-agent` 的重构副本。对应重构计划
-（原项目 `LANGGRAPH_REFACTOR_PLAN.md`）的阶段 0 + 阶段 1（MVP）已完成，
-"必须重构"的四个模块全部落地。
+（原项目 `LANGGRAPH_REFACTOR_PLAN.md`）的阶段 0 + 1（MVP）已完成，
+"必须重构"的四个模块全部落地；第二批"建议重构（保留实现，改造接入方式）"
+六项已完成（见文末）。
 
 ## 已完成（阶段 0 + 1 MVP）
 
@@ -70,3 +71,47 @@
 `novare/`、`web/backend/`、`tests/`、`mcp-server/`（除 data）、`system/`、
 `docker/sandbox/`、`scripts/`、`alembic.ini`、`.env.example`。
 未复制：前端、benchmarks、uv-cache、原 venv。
+
+## 第二批：建议重构（保留实现，改造接入方式）
+
+### 6. 统一三套 LLM JSON 解析（新增 `novare/llm_json.py`）
+
+- `parse_json_object(text, tolerant=)`：严格模式（剥围栏 + 恰好一个对象）
+  与容忍模式（提取 `{...}` 块 / 返回 None）统一实现
+- `call_llm_json(...)`：`llm_client.chat()` + 错误反馈重试的统一循环，
+  `validate`（只校验）/ `convert`（校验后转换）两个显式参数；空内容诊断
+  （finish_reason / reasoning_chars）内建
+- 三处替换：verifier `_call_json`（30 行循环 → 薄包装）、compactor
+  `_summarize_with_llm`（重试循环 → convert 回调）、reflexion
+  `parse_model_json`（→ 容忍模式 re-export）。三份逐行重复的
+  `_parse_json_object` 全部删除，verifier 保留 re-export 兼容测试 import
+
+### 7. recovery 收敛
+
+- 新增 `query_tool_retry_semantics(registry, name)`：retry/idempotency 的
+  getattr 探测逻辑收敛为唯一实现，`agent_loop._tool_retry_policy`、
+  `RecoveryState.register_tool_calls_batch`、graph `nodes/tools._tool_retry_policy`
+  三处统一调用
+- `compute_action_fingerprint` 提升为 state.py 公开 API，
+  `reflexion/triggers.py` 不再引用私有 `_compute_action_fingerprint`
+- 评估后未做 to_dict 快照 memo：快照规模小（每 batch 1-3 个 tool call），
+  脏标记需覆盖全部 mutator、漏标会导致恢复状态陈旧，风险大于收益
+
+### 8. reflexion / task_state / subagents / config
+
+- `reflexion/prompts.py:77` 排版损坏修复（注释与 dict 闭合挤一行）
+- `task_state.py`：if/elif 工具分发改为模块级 `_TOOL_HANDLERS` 映射表 +
+  `register_tool_handler()` 公开 API —— MCP 动态工具可外部注册提取器
+- `subagents/tools.py`：`await_result` 的硬编码 300s 超时参数化
+  （`subagent_await_timeout`，默认与子 agent `turn_timeout` 对齐，
+  消除 300s < 600s 提前放弃的矛盾）
+- `config.py`：63 处 env 样板收敛为 `_env_str/_env_int/_env_float/_env_bool/_env_path`
+  辅助（clamp 边界内联保留、retry_max_delay 的耦合 clamp 保留、布尔的
+  `is not None` 语义保留、非法值告警回退）；`McpServerConfig` 双定义统一到
+  config.py（补 `cwd` 字段），`mcp_client.py` 改为 re-export
+
+### 测试
+
+- 新增 `tests/test_llm_json.py`（16 个）：严格/容忍解析、错误反馈重试、
+  validate/convert 语义、空内容诊断、handler 注册、超时参数化
+- 全量：881 passed, 2 skipped

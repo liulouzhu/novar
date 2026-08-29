@@ -10,6 +10,7 @@ import json
 import re
 from typing import Callable, Iterable
 
+from novare.llm_json import parse_model_json as _llm_parse_model_json
 from novare.reflexion.types import ReflectionDecision, MAX_DIAGNOSIS_LENGTH, MAX_PLAN_ITEM_LENGTH
 from novare.reflexion.triggers import compute_action_fingerprint
 
@@ -390,28 +391,9 @@ def _matches_type(value, expected_type: str) -> bool:
 
 
 def parse_model_json(raw: str) -> dict | None:
-    """解析模型输出 JSON（容忍围栏）。失败返回 None（由调用方决定修复）。"""
-    if not raw:
-        return None
-    text = raw.strip()
-    # 去掉 Markdown 围栏
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.strip()
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        # 尝试提取第一个 { ... } 块
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            return None
-        try:
-            parsed = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(parsed, dict):
-        return None
-    return parsed
+    """解析模型输出 JSON（容忍围栏）。失败返回 None（由调用方决定修复）。
+
+    实现已统一至 novare.llm_json（tolerant 模式），此处保留 re-export
+    以维持 reflexion 内部与测试的 import 路径。
+    """
+    return _llm_parse_model_json(raw)

@@ -12,6 +12,7 @@ import math
 import re
 from typing import Any, Callable
 
+from novare.llm_json import call_llm_json, parse_json_object as _parse_json_object  # noqa: F401
 from novare.subagents.tool_executor import SubagentToolExecutor
 from novare.subagents.types import SubagentType, get_allowlist
 from novare.tool_result import parse_tool_result
@@ -298,42 +299,16 @@ class HallucinationVerifier:
         max_tokens: int,
         validate: Callable[[dict], Any] | None = None,
     ) -> tuple[dict, int]:
-        last_error = ""
-        for attempt in range(1, 3):
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ]
-            if last_error:
-                messages.append({
-                    "role": "user",
-                    "content": "Previous output was rejected: " + last_error + ". Return corrected JSON only.",
-                })
-            try:
-                response = await asyncio.wait_for(
-                    self.llm_client.chat(messages, tools=None, max_tokens=max_tokens),
-                    timeout=self.llm_timeout,
-                )
-                content = str(response.content or "").strip()
-                if not content:
-                    finish_reason = getattr(response, "stop_reason", "unknown")
-                    reasoning_chars = len(str(getattr(response, "reasoning_content", "") or ""))
-                    raise ValueError(
-                        "Verifier model returned no final JSON content "
-                        f"(finish_reason={finish_reason!r}, reasoning_chars={reasoning_chars}). "
-                        "Use a non-reasoning judge, or increase the model output budget."
-                    )
-                payload = _parse_json_object(content)
-                if validate:
-                    validate(payload)
-                return payload, attempt
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                last_error = str(exc)[:400]
-                if attempt == 2:
-                    raise
-        raise RuntimeError("unreachable")
+        """调用评审模型要求 JSON 输出（解析/校验/重试统一走 novare.llm_json）。"""
+        return await call_llm_json(
+            self.llm_client,
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            max_tokens=max_tokens,
+            validate=validate,
+            timeout=self.llm_timeout,
+            max_attempts=2,
+        )
 
     def _parse_claims(self, payload: dict) -> list[AtomicClaim]:
         raw_claims = payload.get("claims")
@@ -530,18 +505,6 @@ class HallucinationVerifier:
             'Return {"corrected_answer":"","changes":[]}. Preserve supported facts; '
             'correct or remove contradicted facts; remove or explicitly qualify claims with insufficient evidence.'
         ))
-
-
-def _parse_json_object(content: str) -> dict:
-    text = content.strip()
-    fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
-    if fence:
-        text = fence.group(1).strip()
-    decoder = json.JSONDecoder()
-    value, end = decoder.raw_decode(text)
-    if not isinstance(value, dict) or text[end:].strip():
-        raise ValueError("verifier response must contain exactly one JSON object")
-    return value
 
 
 def _validate_repair_payload(payload: dict) -> None:

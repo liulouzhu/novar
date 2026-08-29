@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+from novare.recovery.policy import RetryPolicy
+
 if TYPE_CHECKING:
     from novare.session import Session
 
@@ -118,6 +120,43 @@ def _compute_action_fingerprint(tool_name: str, arguments: dict) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# 公开 API：reflexion.triggers 等外部模块统一引用此名称，
+# 不再直接调用私有函数 _compute_action_fingerprint
+compute_action_fingerprint = _compute_action_fingerprint
+
+
+def query_tool_retry_semantics(tool_registry, name: str) -> tuple["RetryPolicy | None", str]:
+    """查询工具的重试策略与幂等性（全项目唯一的 getattr 探测实现）。
+
+    此前 agent_loop._tool_retry_policy 与 RecoveryState.register_tool_calls_batch
+    各自重复实现同样的探测逻辑，现收敛于此供两处调用。
+    tool_registry 不满足协议（缺方法 / 抛异常）时保守回退：
+    retry_policy=None（不重试）、idempotency="non_idempotent"。
+    """
+    declared: RetryPolicy | None = None
+    idempotency = "non_idempotent"
+
+    retry_getter = getattr(tool_registry, "retry_policy_for", None)
+    if callable(retry_getter):
+        try:
+            candidate = retry_getter(name)
+            if isinstance(candidate, RetryPolicy):
+                declared = candidate
+        except Exception:
+            declared = None
+
+    idem_getter = getattr(tool_registry, "idempotency_for", None)
+    if callable(idem_getter):
+        try:
+            candidate = idem_getter(name)
+            if candidate in ("read", "idempotent_write", "non_idempotent"):
+                idempotency = candidate
+        except Exception:
+            idempotency = "non_idempotent"
+
+    return declared, idempotency
 
 
 _SENSITIVE_KEYS = frozenset({
@@ -295,17 +334,12 @@ class RecoveryState:
             tc_name = tc["name"]
             tc_args = tc.get("arguments", {})
 
-            # 查询工具幂等性
-            idempotency = "non_idempotent"
-            if tool_registry:
-                idem_getter = getattr(tool_registry, "idempotency_for", None)
-                if callable(idem_getter):
-                    try:
-                        candidate = idem_getter(tc_name)
-                        if candidate in ("read", "idempotent_write", "non_idempotent"):
-                            idempotency = candidate
-                    except Exception:
-                        idempotency = "non_idempotent"
+            # 查询工具幂等性（探测逻辑统一在 query_tool_retry_semantics）
+            _, idempotency = (
+                query_tool_retry_semantics(tool_registry, tc_name)
+                if tool_registry
+                else (None, "non_idempotent")
+            )
 
             record = self.register_tool_call(tc_id, tc_name, tc_args, idempotency)
             records.append(record)
