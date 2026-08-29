@@ -134,6 +134,11 @@
   无数据库 → InMemorySaver（测试/单进程回退）。`build_thread_id()`：
   `user_id:session_id:run_id`（**turn 级**执行现场，与 RecoveryState 生命周期
   对齐；不采用会话级累积，避免与消息表双数据源漂移）
+- **Windows 平台适配**：psycopg async 要求 SelectorEventLoop，与本项目
+  MCP stdio 依赖的 ProactorEventLoop（subprocess）互斥。Windows 上改用
+  同步 PostgresSaver + `_SyncSaverAsyncBridge`（全部 async 方法转发线程池），
+  已在真实 Postgres 冒烟验证（scripts/smoke_postgres_checkpoint.py：
+  建表 / 崩溃写入 / resume 零重放 / completed 清理全链路通过）
 - **静态编译图**：`build_graph()` 改为无 ctx 构造，GraphRunner 构造时编译一次
   挂载 checkpointer；per-turn 依赖经 `config["configurable"]["run_ctx"]` 注入
   （不可序列化对象不进 checkpoint）；条件边改纯 state 函数
