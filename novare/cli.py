@@ -205,7 +205,6 @@ async def main():
         subagent_registry=subagent_registry,
         llm_client=llm_client,
         system_prompt=config.system_prompt,
-        workspace=config.workspace,
         default_max_iterations=config.subagent_max_iterations,
         turn_timeout=config.subagent_turn_timeout,
     )

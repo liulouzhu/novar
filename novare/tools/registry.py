@@ -230,8 +230,11 @@ _FILE_TOOLS = {"read_file", "write_file", "edit_file", "glob_search", "grep_sear
 
 
 class ToolRegistry:
-    def __init__(self, workspace: Path = Path(".")):
+    def __init__(self, workspace: Path = Path("."), multi_user: bool = False):
         self.workspace = workspace
+        # 多用户模式（Web）：默认 workspace 是所有用户目录的父目录，
+        # 文件类工具必须显式收到 per-user workspace，禁止回退到共享根目录
+        self.multi_user = multi_user
         self._tools: dict[str, ToolDef] = {}
         self._default_tool_context: dict = {}
         self._register_builtins()
@@ -309,9 +312,21 @@ class ToolRegistry:
 
         try:
             kwargs = {"workspace": self.workspace}
-            # Web 多用户隔离：文件类 builtin 工具可用 tool_context["workspace"] 覆盖
-            if name in _FILE_TOOLS and tool_context and "workspace" in tool_context:
-                kwargs["workspace"] = Path(tool_context["workspace"])
+            # 文件类 builtin 工具的 workspace 隔离：
+            # - 单用户（CLI）：使用注册表默认 workspace
+            # - 多用户（Web）：必须由 tool_context["workspace"] 提供用户
+            #   workspace；缺失时 fail-closed，禁止回退到共享 workspace
+            #   （共享目录是所有用户 workspace 的父目录，会跨用户读写）
+            if name in _FILE_TOOLS:
+                workspace_override = tool_context.get("workspace") if tool_context else None
+                if workspace_override:
+                    kwargs["workspace"] = Path(workspace_override)
+                elif self.multi_user:
+                    return _structured_error(
+                        f"Tool '{name}' requires a per-user workspace context",
+                        error_code="PERMISSION_DENIED",
+                        retryable=False,
+                    )
             # MCP 工具和需要上下文的内置工具（如 reviewer_evaluate）传递 tool_context
             needs_context = tool.source.startswith("mcp:") or tool.source == "builtin:context"
             if needs_context:

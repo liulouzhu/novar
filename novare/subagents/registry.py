@@ -39,8 +39,13 @@ class SubagentRegistry:
 
     # ── 创建 ────────────────────────────────────────────────────
 
-    def create(self, subagent_type: SubagentType, task: str) -> SubagentRecord:
-        """创建新子智能体记录（PENDING 状态）"""
+    def create(
+        self, subagent_type: SubagentType, task: str, user_id: str | None = None,
+    ) -> SubagentRecord:
+        """创建新子智能体记录（PENDING 状态）
+
+        user_id: 创建者标识，用于多用户归属校验（CLI 模式为 None）。
+        """
         # 自动清理过期记录并强制容量上限
         self.cleanup_finished(self.cleanup_age_seconds)
         self._enforce_max_records()
@@ -50,10 +55,14 @@ class SubagentRegistry:
             subagent_id=sid,
             type=subagent_type,
             task=task,
+            user_id=user_id,
             status=SubagentStatus.PENDING,
         )
         self._records[sid] = record
-        logger.info("Subagent created: %s (type=%s, task=%s)", sid, subagent_type.value, task[:60])
+        logger.info(
+            "Subagent created: %s (type=%s, user=%s, task=%s)",
+            sid, subagent_type.value, user_id or "-", task[:60],
+        )
         return record
 
     # ── 启动 ────────────────────────────────────────────────────
@@ -127,6 +136,17 @@ class SubagentRegistry:
         """查找子智能体记录"""
         return self._records.get(subagent_id)
 
+    def get_owned(self, subagent_id: str, user_id: str | None) -> SubagentRecord | None:
+        """按归属查找子智能体记录。
+
+        user_id 与创建时不一致（含 None ↔ 非 None）一律返回 None，
+        与"不存在"不可区分，避免向跨用户调用方泄漏记录是否存在。
+        """
+        record = self._records.get(subagent_id)
+        if record is None or record.user_id != user_id:
+            return None
+        return record
+
     def get_output(self, subagent_id: str) -> SubagentOutput | None:
         """获取子智能体输出"""
         record = self._records.get(subagent_id)
@@ -144,6 +164,10 @@ class SubagentRegistry:
     def list_all(self) -> list[SubagentRecord]:
         """列出所有子智能体"""
         return list(self._records.values())
+
+    def list_for_user(self, user_id: str | None) -> list[SubagentRecord]:
+        """列出属于指定用户的子智能体（CLI 模式 user_id=None 只见无归属记录）。"""
+        return [r for r in self._records.values() if r.user_id == user_id]
 
     # ── 清理 ────────────────────────────────────────────────────
 

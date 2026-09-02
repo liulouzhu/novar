@@ -106,7 +106,9 @@ class AgentService:
         else:
             self.reviewer_llm = None
 
-        self.tool_registry = ToolRegistry(workspace=self.config.workspace)
+        # multi_user：Web 部署下 workspace 根目录是所有用户目录的父目录，
+        # 文件类工具必须携带 per-user tool_context，缺失时拒绝执行
+        self.tool_registry = ToolRegistry(workspace=self.config.workspace, multi_user=True)
 
         for name, mcp_cfg in self.config.mcp_servers.items():
             logger.info("Connecting MCP server: %s", name)
@@ -204,9 +206,9 @@ class AgentService:
             subagent_registry=self.subagent_registry,
             llm_client=self.llm_client,
             system_prompt=self.config.system_prompt,
-            workspace=self.config.workspace,
             default_max_iterations=self.config.subagent_max_iterations,
             turn_timeout=self.config.subagent_turn_timeout,
+            multi_user=True,
         )
 
         mode = "dual-model" if self.reviewer_llm else "single-model"

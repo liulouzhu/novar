@@ -134,3 +134,144 @@ class TestSubagentWorkspaceInheritance:
         tc = captured["tool_context"]
         assert tc["workspace"] == str(Path("/ws/user"))
         assert isinstance(tc["workspace"], str)
+
+
+class TestSubagentOwnershipHandlers:
+    """多用户隔离：spawn 绑定创建者，check/list 按归属过滤。"""
+
+    @pytest.mark.asyncio
+    async def test_spawn_binds_user_id_to_record(self):
+        """Web 模式 spawn 创建的记录绑定 user_id。"""
+        reg = SubagentRegistry()
+
+        async def fake_run_subagent(**kwargs):
+            return "done"
+
+        with patch("novare.subagents.tools.run_subagent", side_effect=fake_run_subagent):
+            from novare.subagents.tools import handle_spawn_subagent
+            kwargs = _make_kwargs(user_id="u-1", workspace="/ws/u-1")
+            kwargs["subagent_registry"] = reg
+            result = await handle_spawn_subagent(
+                {"task": "test", "subagent_type": "general", "await_result": True},
+                **kwargs,
+            )
+
+        output = json.loads(result)
+        record = reg.get_owned(output["subagent_id"], "u-1")
+        assert record is not None
+        assert record.user_id == "u-1"
+
+    @pytest.mark.asyncio
+    async def test_spawn_multi_user_requires_user_id(self):
+        """multi_user 模式下无 user_id → 拒绝创建，不产生无归属记录。"""
+        reg = SubagentRegistry()
+        from novare.subagents.tools import handle_spawn_subagent
+        kwargs = _make_kwargs()
+        kwargs["subagent_registry"] = reg
+        kwargs["multi_user"] = True
+
+        result = await handle_spawn_subagent(
+            {"task": "test", "subagent_type": "general"},
+            **kwargs,
+        )
+
+        output = json.loads(result)
+        assert "error" in output
+        assert "用户上下文" in output["error"]
+        assert len(reg.list_all()) == 0
+
+    @pytest.mark.asyncio
+    async def test_spawn_cli_without_user_id_still_works(self):
+        """CLI 模式（multi_user 缺省）无 user_id 仍可创建（原行为保持）。"""
+        reg = SubagentRegistry()
+
+        async def fake_run_subagent(**kwargs):
+            return "done"
+
+        with patch("novare.subagents.tools.run_subagent", side_effect=fake_run_subagent):
+            from novare.subagents.tools import handle_spawn_subagent
+            kwargs = _make_kwargs()
+            kwargs["subagent_registry"] = reg
+            await handle_spawn_subagent(
+                {"task": "test", "subagent_type": "general", "await_result": True},
+                **kwargs,
+            )
+
+        assert len(reg.list_all()) == 1
+        assert reg.list_all()[0].user_id is None
+
+    @pytest.mark.asyncio
+    async def test_check_subagent_owner_can_read(self):
+        """创建者本人可读取子智能体输出。"""
+        from novare.subagents.tools import handle_check_subagent
+        reg = SubagentRegistry()
+        r = reg.create(SubagentType.GENERAL, "my task", user_id="u-1")
+        reg.complete(r.subagent_id, "my result")
+
+        result = await handle_check_subagent(
+            {"subagent_id": r.subagent_id},
+            subagent_registry=reg, user_id="u-1",
+        )
+        output = json.loads(result)
+        assert output["result"] == "my result"
+
+    @pytest.mark.asyncio
+    async def test_check_subagent_other_user_gets_not_found(self):
+        """其他用户查询 → 与不存在相同的错误，不泄漏记录是否存在。"""
+        from novare.subagents.tools import handle_check_subagent
+        reg = SubagentRegistry()
+        r = reg.create(SubagentType.GENERAL, "secret task", user_id="u-1")
+        reg.complete(r.subagent_id, "secret result")
+
+        result = await handle_check_subagent(
+            {"subagent_id": r.subagent_id},
+            subagent_registry=reg, user_id="u-2",
+        )
+        output = json.loads(result)
+        assert "error" in output
+        assert f"未找到子智能体: {r.subagent_id}" == output["error"]
+        assert "secret" not in result
+
+    @pytest.mark.asyncio
+    async def test_check_subagent_anonymous_cannot_read_owned(self):
+        """无 user_id 的调用方查不到有归属的记录。"""
+        from novare.subagents.tools import handle_check_subagent
+        reg = SubagentRegistry()
+        r = reg.create(SubagentType.GENERAL, "t", user_id="u-1")
+        reg.complete(r.subagent_id, "result")
+
+        result = await handle_check_subagent(
+            {"subagent_id": r.subagent_id},
+            subagent_registry=reg,
+        )
+        output = json.loads(result)
+        assert "error" in output
+
+    @pytest.mark.asyncio
+    async def test_list_subagents_filters_by_user(self):
+        """list_subagents 只返回当前用户的子智能体。"""
+        from novare.subagents.tools import handle_list_subagents
+        reg = SubagentRegistry()
+        reg.create(SubagentType.GENERAL, "alice task", user_id="u-1")
+        other = reg.create(SubagentType.GENERAL, "bob task", user_id="u-2")
+
+        result = await handle_list_subagents(
+            {}, subagent_registry=reg, user_id="u-1",
+        )
+        output = json.loads(result)
+        ids = [s["subagent_id"] for s in output["subagents"]]
+        assert other.subagent_id not in ids
+        assert all("bob task" not in s["task"] for s in output["subagents"])
+
+    @pytest.mark.asyncio
+    async def test_list_subagents_anonymous_sees_only_unowned(self):
+        """无 user_id（CLI）只见无归属记录，看不到 Web 用户的。"""
+        from novare.subagents.tools import handle_list_subagents
+        reg = SubagentRegistry()
+        reg.create(SubagentType.GENERAL, "web task", user_id="u-1")
+        cli_record = reg.create(SubagentType.GENERAL, "cli task")
+
+        result = await handle_list_subagents({}, subagent_registry=reg)
+        output = json.loads(result)
+        ids = [s["subagent_id"] for s in output["subagents"]]
+        assert ids == [cli_record.subagent_id]

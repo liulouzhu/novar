@@ -134,3 +134,63 @@ class TestSubagentRegistryCompat:
         count = reg.cleanup_finished(max_age_seconds=0.01)
         assert count == 1
         assert reg.get(r.subagent_id) is None
+
+
+class TestSubagentOwnership:
+    """多用户隔离：check/list 按创建者归属过滤，跨用户不可见。"""
+
+    def test_create_binds_user_id(self):
+        reg = SubagentRegistry()
+        r = reg.create(SubagentType.GENERAL, "t", user_id="u-1")
+        assert r.user_id == "u-1"
+
+    def test_create_without_user_id_owned_by_none(self):
+        """CLI 模式（无 user_id）创建的记录归属为 None。"""
+        reg = SubagentRegistry()
+        r = reg.create(SubagentType.GENERAL, "t")
+        assert r.user_id is None
+
+    def test_get_owned_matches_owner(self):
+        reg = SubagentRegistry()
+        r = reg.create(SubagentType.GENERAL, "t", user_id="u-1")
+        assert reg.get_owned(r.subagent_id, "u-1") is r
+
+    def test_get_owned_rejects_other_user(self):
+        """其他用户的 user_id 查不到记录。"""
+        reg = SubagentRegistry()
+        r = reg.create(SubagentType.GENERAL, "t", user_id="u-1")
+        assert reg.get_owned(r.subagent_id, "u-2") is None
+
+    def test_get_owned_rejects_anonymous(self):
+        """无 user_id（CLI / 降级模式）查不到有归属的记录。"""
+        reg = SubagentRegistry()
+        r = reg.create(SubagentType.GENERAL, "t", user_id="u-1")
+        assert reg.get_owned(r.subagent_id, None) is None
+
+    def test_get_owned_none_matches_none(self):
+        """CLI 模式：无归属记录对无 user_id 调用方可见（原行为保持）。"""
+        reg = SubagentRegistry()
+        r = reg.create(SubagentType.GENERAL, "t")
+        assert reg.get_owned(r.subagent_id, None) is r
+
+    def test_get_owned_unknown_id(self):
+        reg = SubagentRegistry()
+        assert reg.get_owned("sa-nonexistent", "u-1") is None
+
+    def test_list_for_user_filters(self):
+        reg = SubagentRegistry()
+        ra = reg.create(SubagentType.GENERAL, "a", user_id="u-1")
+        rb = reg.create(SubagentType.GENERAL, "b", user_id="u-2")
+        rc = reg.create(SubagentType.GENERAL, "c")  # CLI / 无归属
+
+        owned_u1 = reg.list_for_user("u-1")
+        assert [r.subagent_id for r in owned_u1] == [ra.subagent_id]
+
+        owned_u2 = reg.list_for_user("u-2")
+        assert [r.subagent_id for r in owned_u2] == [rb.subagent_id]
+
+        owned_none = reg.list_for_user(None)
+        assert [r.subagent_id for r in owned_none] == [rc.subagent_id]
+
+        # list_all 不受影响（进程内清理/诊断用途）
+        assert len(reg.list_all()) == 3

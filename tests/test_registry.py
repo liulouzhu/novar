@@ -336,13 +336,15 @@ class TestDefaultToolContext:
             subagent_registry=sub_reg,
             llm_client=fake_llm,
             system_prompt="test",
-            workspace=tmp_workspace,
         )
 
         # execute 的底层函数不应改变（不是闭包替换）
         assert registry.execute.__func__ is original_func
         # 默认上下文已被设置
         assert registry._default_tool_context.get("subagent_registry") is sub_reg
+        # 默认上下文不含 workspace：子智能体 workspace 必须来自 per-user
+        # tool_context，防止继承多用户共享的全局目录
+        assert "workspace" not in registry._default_tool_context
 
 
 class TestFileToolWorkspaceOverride:
@@ -487,3 +489,100 @@ class TestFileToolWorkspaceOverride:
             tool_context={"user_id": "u-abc", "workspace": str(user_ws)},
         )
         assert captured.get("user_id") == "u-abc"
+
+
+class TestFileToolMultiUserFailClosed:
+    """多用户模式下，文件类工具缺少 per-user workspace 时必须 fail-closed。"""
+
+    @pytest.mark.asyncio
+    async def test_missing_workspace_denied(self, tmp_path):
+        """multi_user 注册表 + 无 tool_context → PERMISSION_DENIED，不落盘。"""
+        global_ws = tmp_path / "global"
+        global_ws.mkdir()
+
+        registry = ToolRegistry(workspace=global_ws, multi_user=True)
+        result = await registry.execute(
+            "read_file", {"path": "secret.txt"},
+        )
+        parsed = json.loads(result)
+        assert parsed["ok"] is False
+        assert parsed["error_code"] == "PERMISSION_DENIED"
+        assert parsed["retryable"] is False
+        assert not (global_ws / "secret.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_tool_context_without_workspace_denied(self, tmp_path):
+        """tool_context 有 user_id 但无 workspace → 拒绝（不回退到共享目录）。"""
+        global_ws = tmp_path / "global"
+        global_ws.mkdir()
+
+        registry = ToolRegistry(workspace=global_ws, multi_user=True)
+        result = await registry.execute(
+            "write_file",
+            {"path": "fallback.txt", "content": "ok"},
+            tool_context={"user_id": "u-123"},
+        )
+        parsed = json.loads(result)
+        assert parsed["error_code"] == "PERMISSION_DENIED"
+        assert not (global_ws / "fallback.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_empty_workspace_denied(self, tmp_path):
+        """workspace 为空字符串视为缺失，拒绝执行。"""
+        global_ws = tmp_path / "global"
+        global_ws.mkdir()
+
+        registry = ToolRegistry(workspace=global_ws, multi_user=True)
+        result = await registry.execute(
+            "read_file", {"path": "x.txt"},
+            tool_context={"user_id": "u-1", "workspace": ""},
+        )
+        parsed = json.loads(result)
+        assert parsed["error_code"] == "PERMISSION_DENIED"
+
+    @pytest.mark.asyncio
+    async def test_with_user_workspace_allowed(self, tmp_path):
+        """multi_user 注册表 + per-user workspace → 正常执行。"""
+        global_ws = tmp_path / "global"
+        user_ws = tmp_path / "user"
+        global_ws.mkdir()
+        user_ws.mkdir()
+
+        registry = ToolRegistry(workspace=global_ws, multi_user=True)
+        result = await registry.execute(
+            "write_file",
+            {"path": "hello.txt", "content": "user data"},
+            tool_context={"user_id": "u-1", "workspace": str(user_ws)},
+        )
+        assert "Error" not in result
+        assert (user_ws / "hello.txt").read_text(encoding="utf-8") == "user data"
+
+    @pytest.mark.asyncio
+    async def test_all_file_tools_fail_closed(self, tmp_path):
+        """全部文件类工具在多用户模式下缺 workspace 时均拒绝。"""
+        global_ws = tmp_path / "global"
+        global_ws.mkdir()
+
+        registry = ToolRegistry(workspace=global_ws, multi_user=True)
+        for name, args in (
+            ("read_file", {"path": "a.txt"}),
+            ("edit_file", {"path": "a.txt", "old_string": "x", "new_string": "y"}),
+            ("glob_search", {"pattern": "*"}),
+            ("grep_search", {"pattern": "x"}),
+        ):
+            result = await registry.execute(name, args)
+            parsed = json.loads(result)
+            assert parsed["error_code"] == "PERMISSION_DENIED", f"{name} 应拒绝执行"
+
+    @pytest.mark.asyncio
+    async def test_single_user_mode_unchanged(self, tmp_path):
+        """单用户（默认）模式保持原行为：无 tool_context 用全局 workspace。"""
+        global_ws = tmp_path / "global"
+        global_ws.mkdir()
+
+        registry = ToolRegistry(workspace=global_ws)
+        result = await registry.execute(
+            "write_file", {"path": "cli.txt", "content": "cli data"},
+        )
+        assert "Error" not in result
+        assert (global_ws / "cli.txt").read_text(encoding="utf-8") == "cli data"

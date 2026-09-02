@@ -45,6 +45,7 @@ async def handle_spawn_subagent(args: dict, **kwargs) -> str:
     system_prompt: str = kwargs.get("system_prompt", "")
     user_id: str | None = kwargs.get("user_id")
     workspace = kwargs.get("workspace")
+    multi_user: bool = bool(kwargs.get("multi_user"))
     default_max_iterations: int = kwargs.get("default_max_iterations", 16)
     turn_timeout: int = kwargs.get("turn_timeout", 600)
     # 同步等待上限默认与子 agent 自身 turn_timeout 对齐（原硬编码 300s
@@ -71,8 +72,15 @@ async def handle_spawn_subagent(args: dict, **kwargs) -> str:
     if not all([registry, parent_registry, llm_client]):
         return json.dumps({"error": "子智能体系统未正确初始化"}, ensure_ascii=False)
 
+    # 多用户模式必须绑定创建者，避免产生所有用户都可读取的无归属记录
+    if multi_user and not user_id:
+        return json.dumps(
+            {"error": "缺少用户上下文，无法创建子智能体"},
+            ensure_ascii=False,
+        )
+
     # 创建子智能体记录
-    record = registry.create(subagent_type, task)
+    record = registry.create(subagent_type, task, user_id=user_id)
 
     # 构建子智能体 tool_context（继承父 agent 的 user_id 和 workspace）
     child_tool_context = None
@@ -122,7 +130,7 @@ async def handle_spawn_subagent(args: dict, **kwargs) -> str:
 async def handle_check_subagent(args: dict, **kwargs) -> str:
     """check_subagent 工具处理器
 
-    查询子智能体的状态和结果。
+    查询子智能体的状态和结果。仅能查询当前用户创建的子智能体。
     """
     subagent_id = args.get("subagent_id", "")
     registry: SubagentRegistry = kwargs.get("subagent_registry")
@@ -130,24 +138,25 @@ async def handle_check_subagent(args: dict, **kwargs) -> str:
     if not registry:
         return json.dumps({"error": "子智能体系统未初始化"}, ensure_ascii=False)
 
-    output = registry.get_output(subagent_id)
-    if not output:
+    record = registry.get_owned(subagent_id, kwargs.get("user_id"))
+    if not record:
+        # 归属不一致与不存在返回相同错误，不向跨用户调用方泄漏记录是否存在
         return json.dumps({"error": f"未找到子智能体: {subagent_id}"}, ensure_ascii=False)
 
-    return json.dumps(output.to_dict(), ensure_ascii=False)
+    return json.dumps(record.to_output().to_dict(), ensure_ascii=False)
 
 
 async def handle_list_subagents(args: dict, **kwargs) -> str:
     """list_subagents 工具处理器
 
-    列出所有活跃的子智能体。
+    列出当前用户的所有子智能体。
     """
     registry: SubagentRegistry = kwargs.get("subagent_registry")
 
     if not registry:
         return json.dumps({"error": "子智能体系统未初始化"}, ensure_ascii=False)
 
-    records = registry.list_all()
+    records = registry.list_for_user(kwargs.get("user_id"))
     if not records:
         return json.dumps({"subagents": [], "message": "当前没有子智能体"}, ensure_ascii=False)
 
@@ -163,9 +172,9 @@ def register_subagent_tools(
     subagent_registry: SubagentRegistry,
     llm_client: LLMClient,
     system_prompt: str,
-    workspace,
     default_max_iterations: int = 16,
     turn_timeout: int = 600,
+    multi_user: bool = False,
 ) -> None:
     """在工具注册表中注册子智能体相关的工具
 
@@ -177,19 +186,22 @@ def register_subagent_tools(
         subagent_registry: 子智能体注册表
         llm_client: LLM 客户端
         system_prompt: 系统提示词
-        workspace: 工作空间路径
+        multi_user: 多用户模式（Web）。开启后 spawn_subagent 必须携带
+            user_id（无归属记录会被拒绝），check/list 按创建者过滤。
     """
     from novare.tools.registry import ToolDef
 
-    # 共享的 tool_context —— 每次工具调用时传入 handler 的 kwargs
+    # 共享的 tool_context —— 每次工具调用时传入 handler 的 kwargs。
+    # 故意不含 workspace：子智能体的 workspace 必须来自调用方的 per-user
+    # tool_context，防止异常路径下继承多用户共享的全局 workspace。
     shared_context = {
         "subagent_registry": subagent_registry,
         "parent_tool_registry": tool_registry,
         "llm_client": llm_client,
         "system_prompt": system_prompt,
-        "workspace": workspace,
         "default_max_iterations": default_max_iterations,
         "turn_timeout": turn_timeout,
+        "multi_user": multi_user,
     }
 
     # ── spawn_subagent ──

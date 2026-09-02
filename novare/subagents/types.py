@@ -120,6 +120,9 @@ class SubagentRecord:
     subagent_id: str
     type: SubagentType
     task: str
+    # 创建者标识（Web 模式为用户 UUID，CLI 模式为 None），
+    # check/list 按精确匹配校验归属
+    user_id: str | None = None
     status: SubagentStatus = SubagentStatus.PENDING
     result: str = ""
     error: str | None = None
