@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Novare 智能科研平台 — LangChain/LangGraph 重构工作区"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.0",
+    "mcp>=1.0,<2",  # 2.x 改变了 Server 装饰器 API（research_server.py 用 1.x API）
     "httpx>=0.27",
     "pymupdf4llm>=0.0",
     "networkx>=3.0",

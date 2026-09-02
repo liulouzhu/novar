@@ -156,6 +156,23 @@
 - **checkpoint 清理**：正常完成（completed）的 turn 自动 `adelete_thread`；
   cancelled/timeout/error/max_iterations 保留供显式恢复
 
+## 第四批：前端迁移 + 数据库环境 + 依赖修复
+
+- **前端迁入**：`web/frontend/`（React + Vite + Tailwind，含知识图谱可视化）+
+  `web/start.bat` / `start.sh` 一键启动脚本。WebSocket 事件协议与 legacy
+  保持一致，前端零修改即可对接 graph 运行时；`npm install && npm run build`
+  验证通过
+- **数据库环境**：本地 Docker 容器 `novar-postgres`（postgres:16-alpine，
+  端口 5433，数据卷 `novar_pgdata`，`restart unless-stopped`）；.env 的
+  `DATABASE_URL` 指向它（.env 不入库）；alembic 21 张应用表 + checkpoint
+  4 张表就位
+- **mcp 依赖 pin**：新环境装到 mcp 2.1.1 导致 research_server.py 崩溃
+  （`Server.list_tools` API 变更）；pyproject 固定 `mcp>=1.0,<2`（验证
+  1.29.1 下 8 个领域工具正常注册）
+- **端到端验证**：uvicorn 启动 → health OK（database: ok）→ checkpoint
+  挂载（AsyncBridge[PostgresSaver]）→ GraphRunner 运行时 → MCP 8 工具
+  → startup complete
+
 ### 阶段 2 测试
 
 - 新增 `tests/test_graph_checkpoint.py`（7 个）：thread_id 映射、中途崩溃

@@ -27,6 +27,11 @@ exported_papers/
 profile_output/
 *.log
 
+# 前端
+node_modules/
+web/frontend/dist/
+*.tsbuildinfo
+
 # IDE
 .idea/
 .vscode/
